@@ -31,6 +31,9 @@ Per-row marks do not set the entire declaration's status.
 Body loops/comprehensions set `body_iteration`, not framework parameterization,
 and never increase the static declaration count. Category evidence is conservative:
 unresolved fixtures, imports, services or mocked dependencies remain unknown.
+Literal scalar values in a statically readable `pytest.mark.parametrize` decorator
+may bound the named parameters for closed-assertion classification. Dynamic values
+and fixture arguments remain unresolved.
 
 ## Limitations
 

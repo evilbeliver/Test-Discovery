@@ -28,6 +28,12 @@ parameterization indeterminate. Skipped suites propagate skip status;
 Inline runtime skip/fixme status is unknown when recognized.
 Lexical helper-shadow detection is file-wide rather than a complete scope resolver.
 
+For category classification, scalar literal arrays passed to `.each(...)` may
+bound simple callback parameters. Dynamic data expressions and destructured or
+otherwise complex callback parameters do not. Familiar assertion methods still
+require closed operands; an assertion around an unresolved service call is not
+enough to infer Unit.
+
 Selenium WebDriver and Puppeteer appear in `automation_tools`, not runner totals.
 Their explicit imports are source-use evidence. A tool import alone does not
 establish a test runner. Definition `tools` preserves attribution without counting

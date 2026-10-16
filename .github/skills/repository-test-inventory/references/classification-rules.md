@@ -20,6 +20,12 @@ evidence. Never use a sibling suite's setup. Record `classification_basis` as
 analysis. Pending/body-less definitions remain unknown. Measure category coverage
 and wrong predictions separately, rather than maximizing labels at any cost.
 
+Recognized framework assertion APIs may establish Unit only when their operands
+are closed local computations. Literal scalar rows from supported inline data
+declarations may bound the corresponding test parameters; dynamic data sources,
+fixture arguments, and unresolved calls do not. This evidence is static and does
+not establish that assertions meaningfully test application behavior.
+
 ## Skips and exclusions
 
 Keep explicit skips, TODO/pending declarations, conditional skips, excluded files, and unknown execution status distinct. The current scanner counts explicit declaration-level skip markers and TODO/pending forms; it does not resolve conditional skip logic or runner-level file exclusion patterns. Configuration-based file exclusion is evidence only when it can be read without executing configuration. Never infer that a test is disabled merely because no runner config references it.

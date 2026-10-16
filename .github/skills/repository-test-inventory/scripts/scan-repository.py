@@ -323,6 +323,7 @@ def _js_declaration(match: re.Match[str], code: str, source: str, kind: str) -> 
     end = _closing(code, opening)
     if end is None:
         return None
+    data_expression = source[opening + 1:end] if ".each" in chain else ""
     if ".each" in chain:
         next_call = re.match(r"\s*\(", code[end + 1:])
         if not next_call:
@@ -349,7 +350,7 @@ def _js_declaration(match: re.Match[str], code: str, source: str, kind: str) -> 
     parameterized: bool | None = ".each" in chain
     if not parameterized and title is None:
         parameterized = None
-    return {
+    declaration = {
         "kind": kind, "framework": None, "line": _line(source, match.start()),
         "name": title, "status": status, "status_source": "declaration",
         "parameterized": parameterized,
@@ -357,6 +358,56 @@ def _js_declaration(match: re.Match[str], code: str, source: str, kind: str) -> 
         "evidence": match.group(0).strip(), "_start": match.start(), "_end": end,
         "_body": arguments,
     }
+    parameters = _js_literal_data_parameters(data_expression, arguments)
+    if parameters:
+        declaration["_classification_parameters"] = parameters
+    return declaration
+
+
+def _scalar_literal(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _literal_js_values(expression: str) -> list[Any] | None:
+    if not expression.strip().startswith("["):
+        return None
+    if re.search(r"\b(?:True|False|None)\b", expression):
+        return None
+    translated = re.sub(r"\btrue\b", "True", expression)
+    translated = re.sub(r"\bfalse\b", "False", translated)
+    translated = re.sub(r"\bnull\b", "None", translated)
+    try:
+        values = ast.literal_eval(translated)
+    except (SyntaxError, ValueError):
+        return None
+    return list(values) if isinstance(values, (list, tuple)) else None
+
+
+def _js_literal_data_parameters(data_expression: str, callback: str) -> list[str]:
+    values = _literal_js_values(data_expression)
+    if values is None:
+        return []
+    signature = re.search(r"\((?P<parameters>[^()]*)\)\s*=>|(?P<single>[A-Za-z_$][\w$]*)\s*=>", callback)
+    if not signature:
+        return []
+    raw_parameters = signature.group("parameters")
+    if raw_parameters is None:
+        parameters = [signature.group("single")]
+    else:
+        parameters = [part.strip() for part in raw_parameters.split(",")]
+        if any(not re.fullmatch(r"[A-Za-z_$][\w$]*", item) for item in parameters):
+            return []
+    if not parameters:
+        return []
+    if len(parameters) == 1:
+        valid = all(_scalar_literal(value) for value in values)
+    else:
+        valid = all(
+            isinstance(row, (list, tuple)) and len(row) == len(parameters)
+            and all(_scalar_literal(value) for value in row)
+            for row in values
+        )
+    return parameters if values and valid else []
 
 
 def _evidence(path: str, line: int | None, detail: str) -> dict[str, Any]:
@@ -428,6 +479,37 @@ def _python_declarations(source: str, path: str, configured: bool,
                 result.extend(node.value.elts if isinstance(node.value, (ast.List, ast.Tuple)) else [node.value])
         return result
 
+    def literal_parameter_names(decorators: list[ast.AST]) -> list[str]:
+        for decorator in decorators:
+            if not isinstance(decorator, ast.Call) or qualified(decorator) != "pytest.mark.parametrize":
+                continue
+            if len(decorator.args) < 2 or any(keyword.arg == "indirect" for keyword in decorator.keywords):
+                continue
+            try:
+                names_value = ast.literal_eval(decorator.args[0])
+                rows = ast.literal_eval(decorator.args[1])
+            except (TypeError, ValueError, SyntaxError):
+                continue
+            names = names_value.split(",") if isinstance(names_value, str) else (
+                list(names_value) if isinstance(names_value, (list, tuple)) else []
+            )
+            names = [name.strip() for name in names]
+            if not names or any(not re.fullmatch(r"[A-Za-z_]\w*", name) for name in names):
+                continue
+            if not isinstance(rows, (list, tuple)) or not rows:
+                continue
+            if len(names) == 1:
+                valid = all(_scalar_literal(row) for row in rows)
+            else:
+                valid = all(
+                    isinstance(row, (list, tuple)) and len(row) == len(names)
+                    and all(_scalar_literal(value) for value in row)
+                    for row in rows
+                )
+            if valid:
+                return names
+        return []
+
     declarations: list[dict[str, Any]] = []
 
     def collect(nodes: list[ast.stmt], inherited: list[ast.AST], prefix: str = "") -> None:
@@ -453,7 +535,7 @@ def _python_declarations(source: str, path: str, configured: bool,
                 if status != "skipped":
                     status = "unknown"
             body = "\n".join(ast.unparse(statement) for statement in node.body)
-            declarations.append({
+            declaration = {
                 "kind": "test" if supported else "suspected_test",
                 "framework": "pytest" if supported else None,
                 "name": prefix + node.name, "line": node.lineno,
@@ -463,7 +545,11 @@ def _python_declarations(source: str, path: str, configured: bool,
                                       for statement in node.body for child in ast.walk(statement)),
                 "evidence": "Python AST test declaration with pytest import/configuration evidence" if supported else "Python AST test-like declaration",
                 "_body": _mask_strings(body),
-            })
+            }
+            parameters = literal_parameter_names(decorators)
+            if parameters:
+                declaration["_classification_parameters"] = parameters
+            declarations.append(declaration)
 
     collect(tree.body, marks(tree.body))
     return declarations
@@ -622,7 +708,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                 method = re.search(
                     r"\b(?:public|private|protected|internal)\s+"
                     r"(?:(?:static|async|virtual|override|sealed|new|partial)\s+)*"
-                    r"(?:[\w.<>,?\[\]]+\s+)+(?P<name>\w+)\s*\(",
+                    r"(?:[\w.<>,?\[\]]+\s+)+(?P<name>\w+)\s*\((?P<parameters>[^)]*)\)",
                     following_method,
                 )
                 if not method:
@@ -632,6 +718,8 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                 attributes = (preceding.group(0) if preceding else "") + code[
                     match.start():match.end() + method.start()
                 ]
+                attribute_start = preceding.start() if preceding else match.start()
+                attribute_source = masked[attribute_start:match.end() + method.start()]
                 skipped = bool(re.search(r"\bSkip\s*=|\bIgnore\s*(?:\(|\])", attributes, re.I))
                 declaration_offset = match.end() + method.start() if method else match.start()
                 declaration_key = (declaration_offset, key)
@@ -656,6 +744,11 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                     "evidence": f"[{attribute}]",
                     "_body": body,
                 }
+                parameters = _csharp_literal_data_parameters(
+                    attribute_source, method.group("parameters")
+                )
+                if parameters:
+                    declaration["_classification_parameters"] = parameters
                 existing = csharp_declarations.get(declaration_key)
                 if existing:
                     if skipped:
@@ -781,7 +874,9 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
             declaration.setdefault("status_source", "declaration")
             body = declaration.pop("_body", "")
             declaration.setdefault("body_iteration", bool(re.search(r"\b(?:for|foreach|while)\s*\(", body)))
-            category, evidence = _classify(body, used_keys) if body else ("unknown", [])
+            category, evidence = _classify(
+                body, used_keys, declaration.pop("_classification_parameters", [])
+            ) if body else ("unknown", [])
             basis = "direct" if evidence else "unknown"
             if category == "unknown" and body and declaration["kind"] == "test":
                 setup = _local_setup(code, declaration, declarations)
@@ -949,7 +1044,8 @@ def _language(ext: str) -> str:
     }.get(ext, "Unknown")
 
 
-def _classify(masked: str, framework_keys: list[str]) -> tuple[str, list[str]]:
+def _classify(masked: str, framework_keys: list[str],
+              permitted_parameters: list[str] | None = None) -> tuple[str, list[str]]:
     code = masked.lower()
     evidence: list[str] = []
     if re.search(r"\b(?:page|browser|driver)\.(?:goto|navigate|url|get|locator|getby\w+)\b|\bcy\.visit\b|\bselector\s*\(", code):
@@ -964,12 +1060,86 @@ def _classify(masked: str, framework_keys: list[str]) -> tuple[str, list[str]]:
     if re.search(r"\b(?:testserver|webapplicationfactory|testcontainer|databasefixture|integration)\b", code):
         evidence.append("Integration or external-system test indicator")
         return "integration", evidence
-    if _isolated_assertions(code):
-        return "unit", ["Closed local computation/assertions using recognized standard-library operations"]
+    if _isolated_assertions(code, permitted_parameters, framework_keys):
+        detail = "Closed local computation/assertions using recognized operations"
+        if permitted_parameters:
+            detail += " and literal data parameters"
+        return "unit", [detail]
     return "unknown", evidence
 
 
-def _isolated_assertions(code: str) -> bool:
+def _csharp_literal_data_parameters(attribute_source: str, signature: str) -> list[str]:
+    parameter_names = []
+    for parameter in signature.split(","):
+        match = re.fullmatch(r"\s*[\w.<>,?\[\]]+\s+(\w+)\s*", parameter)
+        if not match:
+            return []
+        parameter_names.append(match.group(1).lower())
+    if not parameter_names or re.search(
+        r"\[(?:TestCaseSource|MemberData|ClassData|DynamicData)\b", attribute_source, re.I
+    ):
+        return []
+    rows: list[list[str]] = []
+    for match in re.finditer(
+        r"\[(?:TestCase|InlineData|DataRow)\b(?P<args>[^\]]*)\]", attribute_source, re.I
+    ):
+        arguments = match.group("args").strip()
+        if not arguments.startswith("(") or not arguments.endswith(")"):
+            return []
+        values = _split_literal_arguments(arguments[1:-1])
+        if values is None or len(values) != len(parameter_names):
+            return []
+        rows.append(values)
+    if not rows or not all(_is_csharp_scalar_literal(value) for row in rows for value in row):
+        return []
+    return parameter_names
+
+
+def _split_literal_arguments(arguments: str) -> list[str] | None:
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index, char in enumerate(arguments):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "," and depth == 0:
+            parts.append(arguments[start:index].strip())
+            start = index + 1
+    if quote or depth != 0:
+        return None
+    last = arguments[start:].strip()
+    if last:
+        parts.append(last)
+    return parts
+
+
+def _is_csharp_scalar_literal(value: str) -> bool:
+    value = value.strip()
+    return bool(
+        re.fullmatch(r'"(?:\\.|[^"\\])*"', value)
+        or re.fullmatch(r"'(?:\\.|[^'\\])'", value)
+        or re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[mMdDfFlLuU]{0,2})", value)
+        or re.fullmatch(r"(?:true|false|null)", value, re.I)
+    )
+
+
+def _isolated_assertions(code: str, permitted_parameters: list[str] | None = None,
+                         framework_keys: list[str] | None = None) -> bool:
     if not re.search(r"\b(?:expect|assert|assert\.\w+)\b", code):
         return False
     # Require a closed vocabulary: unresolved services, helpers, fixture arguments,
@@ -982,6 +1152,7 @@ def _isolated_assertions(code: str) -> bool:
     }
     locals_ = set(re.findall(r"\b(?:var|const|let|string|int|bool|double|decimal)\s+(\w+)\s*=", code))
     locals_.update(re.findall(r"(?<![\w.])([a-z_]\w*)\s*=(?!=|>)", code))
+    locals_.update(name.lower() for name in (permitted_parameters or []))
     allowed_methods = {
         "that", "equal", "equalto", "true", "false", "null", "notnull",
         "isempty", "empty", "single", "contains", "containskey", "getvalueordefault",
@@ -991,6 +1162,12 @@ def _isolated_assertions(code: str) -> bool:
         "tobeundefined", "tobegreaterthan", "tocontain", "tohavelength",
         "tolowercase", "touppercase", "includes", "join",
     }
+    if set(framework_keys or ()) & {"nunit", "xunit", "mstest"}:
+        allowed_methods.update({
+            "areequal", "arenotequal", "istrue", "isfalse", "isnull", "isnotnull",
+            "isnotempty", "isgreaterthan", "islessthan", "notequal",
+            "isassignablefrom", "istype", "inrange", "doesnotcontain", "notempty",
+        })
     for call in re.finditer(r"(?P<member>\.)?\s*(?P<name>[a-z_]\w*)\s*(?:<[^<>]*>)?\s*\(", code):
         name = call.group("name")
         if name not in (allowed_methods if call.group("member") else allowed_roots):

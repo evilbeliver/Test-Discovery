@@ -8,6 +8,12 @@ Moq, NSubstitute, and FluentAssertions are supporting libraries, not independent
 
 Package references and project markers are declarations; attributes in source are active usage. Count each distinct test method once, collapsing repeated test/data attributes on that method. Data attributes add parameterized inputs, not extra test definitions. `[Fact(Skip = ...)]`, `[Theory(Skip = ...)]`, and method-local `[Ignore]` forms are explicit skip evidence. Ignore attributes must not leak to adjacent methods.
 
+Common MSTest, NUnit, and xUnit assertion names can support Unit classification
+when the assertion operands contain only literals, local values, and recognized
+operations. Simple scalar literals in `[TestCase]`, `[InlineData]`, and `[DataRow]`
+may bound method parameters for this check. Source/member/class data and unresolved
+calls remain unclassified unless other direct evidence supports a category.
+
 Expose the source method name and first recognized test-attribute line. Resolve the shared `[Theory]` name using an explicit NUnit/xUnit namespace or an unambiguous nearest-project package reference. If neither resolves it, report a limitation rather than arbitrarily assigning a framework.
 
 ## Project files

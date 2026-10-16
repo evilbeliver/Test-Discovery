@@ -201,30 +201,31 @@ environment, the follow-up run's inventory JSON and Markdown were identical apar
 from scan timestamps. Workflow elapsed timings also vary. Stable output makes
 comparisons reliable, but cannot prove the scanner's decisions are correct.
 
-### Measured Run 3 follow-up
+### Measured classifier follow-up
 
-The skill update following Run 3 was checked against the independent
-100-definition fixture with its explicit generated-directory exclusion:
+The classifier update was checked against the independent 100-definition fixture
+with its explicit generated-directory exclusion. The earlier Run 4 results and
+the updated scanner results are shown separately:
 
-| Measurement | Result |
-|---|---:|
-| Discovery TP / FP / FN | 100 / 0 / 0 |
-| Precision / recall / F1 | 100% / 100% / 100% |
-| Supported-scope recall | 100 / 100 |
-| Framework and status | Each 100 / 100 correct |
-| Category | 57 correct, 0 incorrect, 43 unknown |
-| Framework parameterization | 99 matches, 1 baseline disagreement |
-| Exclusions and required unknown-asset retention | PASS |
-| Skill regression tests | 57 passed |
-| Overall validation / exit | Non-pass / `1` |
+| Measurement | Run 4 | Updated |
+|---|---:|---:|
+| Discovery TP / FP / FN | 100 / 0 / 0 | 100 / 0 / 0 |
+| Precision / recall / F1 | 100% / 100% / 100% | 100% / 100% / 100% |
+| Framework and status | Each 100 / 100 correct | Each 100 / 100 correct |
+| Category correct / incorrect / unknown | 57 / 0 / 43 | 68 / 0 / 32 |
+| Framework parameterization correct / baseline disagreement | 99 / 1 | 99 / 1 |
+| Exclusions and required unknown-asset retention | PASS | PASS |
+| Skill regression tests | 57 passed | 59 passed |
+| Overall validation / exit | Non-pass / `1` | Non-pass / `1` |
 
-The remaining parameterization disagreement is a body-loop test: the baseline
-expects `true`, while the chosen declaration-driven policy reports
-`parameterized: false` and `body_iteration: true`. The category abstentions and
-that disagreement explain the non-pass; they are not a scanner crash or discovery
-failure. The independent baseline was left unchanged. These are results for this
-fixture, not a guarantee for arbitrary repositories, and fixture tests were not
-executed.
+The updated classifier recognizes additional framework assertions only for
+closed operands and permits parameters from supported literal data rows. The
+remaining unknowns include unresolved services, dynamic/member data, fixtures,
+and pending declarations; the Run 4 sample's unresolved cases continue to abstain.
+The parameterization disagreement is a body-loop test: the baseline expects
+`true`, while the declaration-driven policy reports `parameterized: false` and
+`body_iteration: true`. These results are specific to this fixture, not a
+guarantee for arbitrary repositories. The fixture's tests were not executed.
 
 ### Independent baseline requirements
 

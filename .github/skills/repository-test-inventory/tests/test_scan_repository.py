@@ -231,7 +231,7 @@ test('same name', () => {});
         for definition in definitions:
             self.assertEqual(definition["path"], "tests/examples.test.js")
             self.assertGreater(definition["line"], 0)
-            self.assertEqual(definition["category"], "unknown")
+        self.assertEqual([d["category"] for d in definitions], ["unit", "unknown"])
         self.assertIn("- Classification: unknown (insufficient implementation evidence)\n", markdown)
         self.assertNotIn("\nC\nl\na\ns\ns\n", markdown)
         again, _ = self.scan()
@@ -482,6 +482,94 @@ describe('two', () => {
         self.assertEqual(tests["api"]["category"], "api")
         self.assertEqual(tests["component"]["category"], "component")
         self.assertEqual(tests["pending"]["category"], "unknown")
+
+    def test_framework_assertions_require_closed_operands(self) -> None:
+        self.write("MSTests.cs", """
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+public class AccountTests {
+  [TestMethod] public void EqualLiterals() => Assert.AreEqual("password", "password");
+  [TestMethod] public void ClosedBoolean() => Assert.IsTrue(3 >= 3);
+  [TestMethod] public void CallsService() => Assert.AreEqual(1, service.Load());
+}
+""")
+        data, _ = self.scan()
+        definitions = data["test_files"][0]["definitions"]
+        self.assertEqual([item["category"] for item in definitions], ["unit", "unit", "unknown"])
+
+    def test_literal_data_rows_bound_parameter_classification(self) -> None:
+        self.write("Tests.cs", """
+using Xunit;
+public class DataTests {
+  [Theory]
+  [InlineData(" ADA@EXAMPLE.COM ", "ada@example.com")]
+  [InlineData("BOB@example.com", "bob@example.com")]
+  public void Normalizes(string source, string expected) =>
+      Assert.Equal(expected, source.Trim().ToLowerInvariant());
+  [Theory]
+  [MemberData(nameof(DynamicCases))]
+  public void KeepsDynamicDataUnknown(string source, string expected) =>
+      Assert.Equal(expected, service.Normalize(source));
+}
+""")
+        self.write("package.json", '{"devDependencies":{"vitest":"1"}}')
+        self.write("tests/literal.test.js", """
+import { test, expect } from 'vitest';
+test.each(['  wireless  ', ' wireless '])('trims %s', query => {
+  expect(query.trim()).toBe('wireless');
+});
+test.each(loadQueries())('does not trust dynamic data', query => {
+  expect(query.trim()).toBe('wireless');
+});
+test.each([TRUE])('does not treat identifiers as literals', query => {
+  expect(query.trim()).toBe('wireless');
+});
+test('does not treat .NET assertion names as generic APIs', () => {
+  assert.IsTrue(3 >= 3);
+});
+""")
+        self.write("tests/test_literal_data.py", """
+import pytest
+@pytest.mark.parametrize("value", [1, 2])
+def test_literal_value(value):
+    assert value > 0
+def test_unresolved_fixture(carrier_client):
+    assert carrier_client["rate"] > 0
+""")
+        data, _ = self.scan()
+        definitions = {
+            (item["path"], item["name"]): item
+            for file in data["test_files"]
+            for item in file["definitions"]
+        }
+        self.assertEqual(
+            definitions[("Tests.cs", "Normalizes")]["category"], "unit"
+        )
+        self.assertEqual(
+            definitions[("Tests.cs", "KeepsDynamicDataUnknown")]["category"], "unknown"
+        )
+        self.assertEqual(
+            definitions[("tests/literal.test.js", "trims %s")]["category"], "unit"
+        )
+        self.assertEqual(
+            definitions[("tests/literal.test.js", "does not trust dynamic data")]["category"],
+            "unknown",
+        )
+        self.assertEqual(
+            definitions[("tests/literal.test.js", "does not treat identifiers as literals")]["category"],
+            "unknown",
+        )
+        self.assertEqual(
+            definitions[("tests/literal.test.js", "does not treat .NET assertion names as generic APIs")]["category"],
+            "unknown",
+        )
+        self.assertEqual(
+            definitions[("tests/test_literal_data.py", "test_literal_value")]["category"],
+            "unit",
+        )
+        self.assertEqual(
+            definitions[("tests/test_literal_data.py", "test_unresolved_fixture")]["category"],
+            "unknown",
+        )
 
     def test_tools_are_reported_separately_without_duplicate_definitions(self) -> None:
         self.write("package.json", '{"devDependencies":{"mocha":"1","selenium-webdriver":"1"}}')
