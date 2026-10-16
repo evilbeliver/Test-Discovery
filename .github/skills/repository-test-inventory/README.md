@@ -192,9 +192,10 @@ test('accepts positive inputs', () => {
 ```
 
 Each example is one static definition. The second contains repeated checks, but
-the framework is not parameterizing the declaration. A baseline using a broader
-meaning can disagree. Preserve that discrepancy and review the definitions
-explicitly; do not relabel the report or silently edit the baseline to get a pass.
+the framework is not parameterizing the declaration. Under this policy,
+`parameterized` remains false and `body_iteration` is true. Baselines should use
+the same distinction; review any conflicting entry against its source and update
+the documented ground truth only when that policy decision is explicit.
 
 **Repeatability is not accuracy.** With the same inputs, options, scanner and
 environment, the follow-up run's inventory JSON and Markdown were identical apart
@@ -213,7 +214,7 @@ the updated scanner results are shown separately:
 | Precision / recall / F1 | 100% / 100% / 100% | 100% / 100% / 100% |
 | Framework and status | Each 100 / 100 correct | Each 100 / 100 correct |
 | Category correct / incorrect / unknown | 57 / 0 / 43 | 68 / 0 / 32 |
-| Framework parameterization correct / baseline disagreement | 99 / 1 | 99 / 1 |
+| Framework parameterization correct / baseline disagreement | 99 / 1 | 100 / 0 |
 | Exclusions and required unknown-asset retention | PASS | PASS |
 | Skill regression tests | 57 passed | 59 passed |
 | Overall validation / exit | Non-pass / `1` | Non-pass / `1` |
@@ -222,10 +223,12 @@ The updated classifier recognizes additional framework assertions only for
 closed operands and permits parameters from supported literal data rows. The
 remaining unknowns include unresolved services, dynamic/member data, fixtures,
 and pending declarations; the Run 4 sample's unresolved cases continue to abstain.
-The parameterization disagreement is a body-loop test: the baseline expects
-`true`, while the declaration-driven policy reports `parameterized: false` and
-`body_iteration: true`. These results are specific to this fixture, not a
-guarantee for arbitrary repositories. The fixture's tests were not executed.
+The reviewed fixture baseline now follows the documented declaration-driven
+parameterization policy: the body-loop example is `parameterized: false` and
+`body_iteration: true`. This source-backed baseline correction removes the one
+policy mismatch; it does not change scanner logic or discovery. These results are
+specific to this fixture, not a guarantee for arbitrary repositories. The
+fixture's tests were not executed.
 
 ### Independent baseline requirements
 

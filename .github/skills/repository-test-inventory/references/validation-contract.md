@@ -57,11 +57,13 @@ to overwrite nonempty output directories. Scanner failure stops validation;
 validator non-pass and unverifiable results keep their distinct nonzero exits.
 Input/I/O errors are explicit errors, not successful empty inventories.
 
-Framework parameterization is declaration-driven. A baseline treating a body
-loop as parameterization can therefore disagree with the scanner's false
-prediction even while `body_iteration` is true. Preserve and explain that
-semantic disagreement; do not edit the independent baseline or normalize it
-away to get a pass. Body iteration is not a required comparison in legacy baselines.
+Framework parameterization is declaration-driven: a supported framework
+data-driven declaration sets `parameterized: true`; a loop inside a test body
+sets only `body_iteration`. Keep an independent baseline aligned to this stated
+policy. If a reviewed baseline entry conflicts with the policy, correct that
+entry with source-backed rationale and retain the historical change; do not
+silently tune scanner output to the baseline. Body iteration is not a required
+comparison in legacy baselines.
 
 ## Independent validator limitations
 
