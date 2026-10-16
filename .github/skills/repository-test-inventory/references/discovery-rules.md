@@ -15,6 +15,11 @@
 
 Use static inspection of source files, manifests, project/solution files, and test-runner configuration. A dependency or configuration identifies a declared framework, but does not alone establish active tests. Record active test-definition evidence separately. Do not load configuration by executing it.
 
+Declaration-free runner configurations are framework context, not suspected test
+files. Configurations that actually contain declarations remain eligible. Python
+uses AST declarations plus explicit pytest import/ancestor configuration evidence;
+see [pytest rules](./python-pytest.md).
+
 Recognize tests from framework APIs/attributes and imports/namespaces, not filename alone. Test-like names and generic test declarations can surface suspected unknown assets, but are not proof of a supported framework. Inspect nested projects independently and associate a source file with its nearest project file.
 
 Malformed manifests and unreadable files must be reported as limitations; continue with other files. Never silently turn an error into an empty successful inventory.
@@ -23,4 +28,9 @@ Malformed manifests and unreadable files must be reported as limitations; contin
 
 Count syntactically recognized test declaration sites, not data rows, parameter values, runtime cases, or executions. Count one parameterized declaration once. Ignore comments and C# inactive preprocessor branches where recognized. Dynamic aliases, generated code, unusual macros, and complex syntax may prevent a precise count; report limitations rather than guessing.
 
-Use schema 1.1 definition paths/names/IDs/lines for matching, not aggregate totals. Python function patterns remain suspected unsupported declarations and are reported as limitations. JavaScript declaration patterns are not applied to other source languages. Member calls such as regex `.test()` and conventional locally declared helpers are not test API declarations.
+Use schema 1.1 definition paths/names/IDs/lines for matching, not aggregate totals.
+Python declarations without pytest evidence remain suspected. JavaScript patterns
+are not applied to other source languages. Member calls such as regex `.test()`
+and conventional locally declared helpers are not test API declarations.
+Framework parameterization and syntactic `body_iteration` are separate;
+neither body loops nor parameter rows increase definition counts.

@@ -14,24 +14,54 @@ For a VS Code workspace, copy this folder to:
 
 The Python scanner requires Python 3.10 or later and has no third-party dependencies. The Skill can be used manually even in agent environments that do not support automatic Skill loading.
 
+The canonical skill name is `repository-test-inventory`; "Test-Discovery" and
+"test discovery" are trigger wording in its description, not alternate names.
+Open the repository containing `.github` as your workspace, or install the folder
+in the intended workspace. In a fresh agent session, verify that the canonical
+skill is listed and loads. Running the scanner alone does not verify agent loading.
+
 ## Run without an AI agent
 
 Prerequisite: **Python 3.10+**, with no third-party dependencies. These commands test the deterministic scanner, **not** an agent's ability to discover, load, or follow this Skill.
 
-Start in the repository containing the installed Skill (the folder containing `.github`). Quote every path, including paths assigned to variables. For the supplied local validation layout:
+Start in the repository containing the installed Skill (the folder containing `.github`). Quote every path, including paths assigned to variables. Replace the example target and report paths for your installation:
 
 ```sh
-cd "/Users/davidcristinzio/Desktop/Test Discovery"
 SKILL_DIR="$PWD/.github/skills/repository-test-inventory"
-TARGET_REPO="/Users/davidcristinzio/Desktop/Testing Discovery Skill test 1/Test-Data/qa-test-inventory-validation"
-REPORT_DIR="$HOME/test-inventory-results/round-2"
+TARGET_REPO="/absolute/path/to/fixture repository"
+REPORT_DIR="$HOME/test-inventory-results/new-run"
 python3 --version
 python3 "$SKILL_DIR/scripts/scan-repository.py" "$TARGET_REPO" \
   --output-directory "$REPORT_DIR" \
   --exclude "scenarios/09-edge-cases/generated" --verbose
 ```
 
-For another installation/target, change the starting directory and `TARGET_REPO`. The explicit generated-directory exclusion above is the controlled fixture's policy, **not a scanner default**. For an ordinary scan, omit that option unless appropriate.
+For another installation/target, change the starting directory and `TARGET_REPO`. The explicit generated-directory exclusion above is the controlled fixture's policy, **not a scanner default**. For an ordinary scan, omit that option unless appropriate. With an absolute `SKILL_DIR`, commands work from any directory, including paths containing spaces.
+
+### One-command scan and validation
+
+When an independent baseline is available, prefer:
+
+```sh
+python3 "$SKILL_DIR/scripts/scan-and-validate.py" "$TARGET_REPO" \
+  --expected "$TARGET_REPO/validation/expected-inventory.json" \
+  --output-directory "$REPORT_DIR" \
+  --exclude "scenarios/09-edge-cases/generated"
+```
+
+Use a **fresh, empty** report directory outside the target. This workflow refuses
+to overwrite prior evidence. It accepts the scanner's `--include`, `--exclude`,
+and `--no-default-excludes` options and never runs target code. It generates both
+scanner and validation reports plus `workflow-summary.json`, recording commands,
+stage exit codes, elapsed timings, Python version, scanner/validator/workflow and
+baseline hashes, scan/source provenance, report paths, limitations, discovery
+metrics and matched-definition dimensions. Scanner completion, assessability and
+validation passing remain separate. The workflow returns the scanner failure or
+validator exit code; assessable non-pass stays nonzero. Validator input failures
+are explicitly recorded as errors, not successful empty comparisons.
+
+Timings are local measurements, not a benchmark. Measure larger repositories
+before adding performance caches, concurrency, or dependencies.
 
 Reports must be outside `TARGET_REPO`. The scanner creates the report directory and generates `inventory-report.md` and `test-inventory.json`. It prints their locations. Exit `0` means the scan completed, not that the inventory is accurate or validated; inspect `scan.status` and `limitations` too. Existing report files are overwritten; linked report files are rejected.
 
@@ -71,7 +101,7 @@ Read `scan_completed`, `results_assessable`, and `validation_passed` separately.
 - Require schema `1.1` definition records for validation. Rerun the current scanner if the earlier artifact uses schema `1.0`; changing the version field cannot recover missing source names. Dynamic/null names remain unverifiable and must not be invented.
 - Inspect definition paths, names, and lines for apparent false positives, especially ordinary member `.test()` calls and locally declared helpers. Report discrepancies without silently editing the generated inventory or using the baseline to tune detection.
 - Review unknown framework attribution separately from unknown categories. In particular, recognized NUnit, xUnit, or MSTest methods need implementation evidence for a category; a test-project or framework name does not prove Unit, API, or Integration.
-- Report discovery TP/FP/FN and precision/recall/F1 rather than judging accuracy by closeness to the expected total. Include full-baseline and supported-scope results separately: Python/pytest is unsupported and remains in the full-baseline denominator.
+- Report discovery TP/FP/FN and precision/recall/F1 rather than judging accuracy by closeness to the expected total. Include full-baseline and supported-scope results separately; unsupported frameworks remain in the full-baseline denominator. Current supported scope includes pytest.
 - Report matched-definition attribution, category, status, and parameterization results, plus unknown-asset retention, exclusions, and unverifiable checks. A completed scan is not a validated pass. Scanner validation also does not certify that an agent loaded or followed the Skill.
 
 The independent validator shipped in the fixture repository has different exit semantics: `0` means only that no supported comparison failed, even when all checks are `UNVERIFIABLE`. It also requires exact unknown/excluded lists. That repository is not modified here. Prefer the bundled validator for fail-closed outcomes; the adapted JSON supports its documented definition-array input shape, but does not repair its policies. See [validation contract](./references/validation-contract.md).
@@ -108,7 +138,7 @@ The exact Python cache/environment defaults are `__pycache__`, `.venv`, `venv`, 
 
 ## Framework coverage
 
-JavaScript/TypeScript frameworks: Playwright, Jest, Cypress, Vitest, Mocha, Jasmine, WebdriverIO, Selenium WebDriver, Puppeteer, Protractor, and TestCafe.
+JavaScript/TypeScript frameworks: Playwright, Jest, Cypress, Vitest, Mocha, Jasmine, WebdriverIO, Protractor, and TestCafe. Selenium WebDriver and Puppeteer are browser automation tools, shown separately from runners.
 
 .NET frameworks: NUnit, xUnit, and MSTest.
 
@@ -116,7 +146,12 @@ Supporting libraries include React Testing Library, Angular Testing Library, Enz
 
 Unknown test-like assets are retained as suspected files rather than silently dropped or assigned an invented framework. Framework declarations from manifests/configuration are distinct from active test-definition evidence.
 
-**pytest is unsupported in this release.** Python `test*` functions are retained as suspected declarations, with source names/lines and an explicit limitation. They do not contribute to recognized totals. Do not infer pytest from Python function naming alone.
+Python: pytest, using the standard-library AST and explicit pytest import or
+ancestor configuration evidence. Top-level `test*` functions and methods in
+non-inheriting `Test*` classes without constructors count once. Imported aliases,
+fixture exclusion, class/module marks, parameterization and skip markers are
+recognized. Conditional/runtime skips and expected failures remain `unknown`.
+Python names alone do not prove pytest. See [pytest rules](./references/python-pytest.md).
 
 ## JSON contract
 
@@ -129,6 +164,7 @@ Unknown test-like assets are retained as suspected files rather than silently dr
 | `scan` | Scanner SHA256, UTC timestamp, read-only mode, completion status, options, inspected-file count, encountered excluded paths, and solution files |
 | `languages` | Languages with discovered test source assets |
 | `frameworks` | Framework identity, language, confidence, declared/active status, evidence, files, and static definition count |
+| `automation_tools` | Browser automation tools with declared/used status, source evidence and associated files; never add their counts to runner totals |
 | `supporting_libraries` | Non-framework test-support dependencies and manifest evidence |
 | `test_projects` | Detected .NET test project paths and associated files |
 | `test_files` | File metadata/counts/evidence and `definitions[]` records; see below |
@@ -137,24 +173,33 @@ Unknown test-like assets are retained as suspected files rather than silently dr
 
 Confidence values are `confirmed`, `probable`, or `unknown`. Test categories are `ui_e2e`, `component`, `unit`, `api`, `integration`, and `unknown`. Per-definition status is `active`, `skipped`, `todo`, or `unknown`.
 
-Each nested definition contains `path`, deterministic `id`, source `name` (nullable for dynamic/unresolved names), `line`, `kind` (`test`, `suite`, `suspected_test`), framework key (nullable), confidence, evidence, `tools`, category/classification evidence, status/status source, and nullable boolean `parameterized`. IDs combine path, kind, source name (line fallback), and duplicate-name occurrence. Named IDs survive unrelated line insertions, but renames/moves or reordering identical names can change them; they are not runtime runner IDs. C# lines identify the first recognized test attribute.
+Each nested definition contains `path`, deterministic `id`, source `name` (nullable for dynamic/unresolved names), `line`, `kind` (`test`, `suite`, `suspected_test`), framework key (nullable), confidence, evidence, `tools`, category/classification evidence, `classification_basis` (`direct`, `inferred_setup`, `unknown`), status/status source, nullable boolean `parameterized`, and boolean `body_iteration`. The latter records syntactic loops/comprehensions, not proof of data-driven testing. These are additive schema `1.1` fields; the adapter retains body iteration without comparing it to legacy baseline parameterization. IDs combine path, kind, source name (line fallback), and duplicate-name occurrence. Named IDs survive unrelated line insertions, but renames/moves or reordering identical names can change them; they are not runtime runner IDs. C# lines identify the first recognized test attribute; Python lines identify the function.
 
 Definition categories use local declaration-body evidence, not the containing file's category. Unknown C# or non-browser unit classifications are intentional when isolation is not established. File-category aggregates remain file counts. Generic test APIs do not alone establish Playwright. Mocha can be the runner while Selenium is recorded in definition `tools`.
 
+Closed local assertions and recognized standard-library operations can establish
+Unit. Unknown calls/receivers remain unknown, including unresolved imports,
+fixtures and mocks. Bounded, lexically enclosing JS arrow `beforeEach` setup can
+supply closed local values; such results are explicitly `inferred_setup`.
+Sibling-suite hooks do not supply evidence. This is not a transitive symbol or
+import resolver. Pending/body-less definitions stay unknown. Report category
+coverage separately from wrong predictions; never guess from framework or title.
+
 ### Counting rules
 
-- A test definition is a recognized declaration site, not a runtime execution or a parameterized row. A parameterized declaration counts once. Framework-neutral Python/Go/Java/Kotlin/Rust/Ruby patterns are recorded separately as suspected declarations and do not inflate the recognized definition total.
+- A test definition is a recognized declaration site, not a runtime execution or a parameterized row. A parameterized declaration counts once. Ambiguous Python and unsupported Go/Java/Kotlin/Rust/Ruby declarations remain suspected and do not inflate recognized totals.
 - A suite count includes only recognized JavaScript/TypeScript suite declarations; test classes are not automatically counted as suites.
 - Skipped and TODO counts are subsets of recognized test definitions.
 - Explicit skipped suites propagate skipped status to enclosed JS definitions. `xit`/`xtest` are skipped; callback-free declarations are pending (`todo`). Recognized inline Playwright skip/fixme calls produce unknown status rather than claiming unconditional execution. Other conditional/runtime mechanisms remain unresolved.
-- `.each(...)` indicates parameterization. C# Theory/TestCase/TestCaseSource/DataTestMethod/DataRow/DynamicData attributes indicate parameterization where recognized. Loops inside a JS body are indeterminate (`null`), not counted as additional definitions or silently treated as proven non-parameterized.
+- `.each(...)`, pytest `mark.parametrize`, and recognized C# data attributes indicate framework parameterization. A body loop alone leaves `parameterized: false` and records `body_iteration: true`; incidental and data-input loops are not equated. Dynamic JS titles can still leave parameterization indeterminate. None of these forms add runtime rows to definition counts.
 - Test-file totals include recognized and suspected source files. Classification totals count files once by their primary category.
+- `recognized_test_file_count`, `suspected_test_file_count`, `unknown_framework_file_count`, and `unknown_category_file_count` distinguish overlapping file populations. Declaration-free runner configurations are context only, even when their names contain `test`.
 - Framework package/config evidence alone does not prove active tests. Categories are based on test implementation indicators, never framework name alone.
 - Markdown and JSON values share one model. Reports include repository-relative evidence paths and line numbers for source declarations where available.
 
 ## Limitations and safety
 
-This is static lexical analysis, not a language parser. Dynamic aliases, decorators/macros, source generators, unconventional syntax, regex literals containing declaration-like text, runner configuration executed at runtime, and complex conditional compilation may reduce detection accuracy. Conditional skips are not evaluated. Runtime-disabled tests must not be inferred active from these static labels. Arbitrary non-JS/.NET frameworks may be surfaced as unknown but are not exhaustively parsed. The scanner deliberately avoids examining arbitrary JSON documents and inspects only source files, `package.json`, selected runner configuration, and .NET project/solution files. Files above 1 MB and symbolic links are skipped and reported.
+This combines lexical JS/.NET analysis with Python AST inspection; it is not runner collection. Dynamic aliases, decorators/macros, source generators, unconventional syntax, regex literals containing declaration-like text, executable configuration, and complex conditional compilation may reduce accuracy. Python AST parsing never imports target modules. Conditional skips are not evaluated. Runtime-disabled tests must not be inferred active from static labels. Other frameworks may remain unknown. The scanner examines source files, `package.json`, selected runner/pytest configuration, and .NET project/solution files, not arbitrary JSON. Files above 1 MB and symbolic links are skipped and reported.
 
 The scanner contains no repository-specific assumptions, does not require Git metadata, and emits no source snippets, secrets, environment variables, or dependency cache contents.
 
@@ -163,12 +208,17 @@ The scanner contains no repository-specific assumptions, does not require Git me
 Run synthetic fixture tests with:
 
 ```sh
-python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SKILL_DIR/tests" -v
 ```
 
 Tests cover Playwright, Jest, NUnit, xUnit, MSTest, parameterized and skipped definitions, unknown assets, empty inventories, exclusions, nested projects, output safety, invalid inputs, symlink handling, and malformed manifests.
 
 Additional regressions cover member-call/helper false positives, ambiguous framework attribution, language boundaries, names/IDs, mixed definition categories, suite skips/pending/conditional status, readable Markdown, paths with spaces, unchanged target contents, schema adaptation, TP/FP/FN matching, partial/unverifiable validation, and exclusion/unknown policies. No target application dependencies are installed or run.
+
+Run 3 follow-up regressions also cover pytest AST aliases, fixtures, module/class
+marks, conditional status, configuration scoping, malformed Python/INI inputs,
+separate body iteration, scoped setup evidence, runner/tool presentation, and
+combined workflow exits 0/1/2/3 with provenance and overwrite prevention.
 
 ## Extending
 

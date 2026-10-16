@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import configparser
 import fnmatch
 import hashlib
 import json
@@ -56,6 +58,12 @@ DOTNET_FRAMEWORKS = {
     "xunit": ("xUnit", ".NET", ["xunit", "Xunit"], r"\[(?:Fact|Theory|InlineData|MemberData|ClassData)\b"),
     "mstest": ("MSTest", ".NET", ["MSTest.TestFramework", "Microsoft.VisualStudio.TestTools.UnitTesting"], r"\[(?:TestMethod|DataTestMethod|TestClass|DataRow)\b"),
 }
+PYTHON_FRAMEWORKS = {
+    "pytest": ("pytest", "Python", ["pytest"], r"\bpytest\b"),
+}
+FRAMEWORKS = {**JS_FRAMEWORKS, **DOTNET_FRAMEWORKS, **PYTHON_FRAMEWORKS}
+AUTOMATION_TOOLS = {"selenium-js", "puppeteer"}
+PYTEST_CONFIGS = {"pytest.ini", ".pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
 SUPPORT_PACKAGES = {
     "react-testing-library": ("React Testing Library", ["@testing-library/react", "react-testing-library"]),
     "angular-testing-library": ("Angular Testing Library", ["@testing-library/angular", "@testing-library/jest-angular"]),
@@ -79,7 +87,6 @@ CS_ATTRIBUTE = re.compile(
     re.IGNORECASE,
 )
 UNKNOWN_DECLARATIONS = {
-    ".py": re.compile(r"^\s*(?:async\s+)?def\s+(?P<name>test\w*)\s*\(", re.MULTILINE),
     ".go": re.compile(r"^\s*func\s+(?P<name>Test\w+)\s*\(", re.MULTILINE),
     ".java": re.compile(r"@\s*Test\b"),
     ".kt": re.compile(r"@\s*Test\b"),
@@ -264,6 +271,7 @@ def _walk(root: Path, includes: list[str], excludes: list[str], default_excludes
             basename = name.lower()
             context_file = (
                 basename == "package.json"
+                or basename in PYTEST_CONFIGS
                 or candidate.suffix.lower() in {".csproj", ".sln", ".slnx"}
                 or any(basename.startswith(config_name) for config_names in CONFIG_HINTS.values() for config_name in config_names)
             )
@@ -339,12 +347,13 @@ def _js_declaration(match: re.Match[str], code: str, source: str, kind: str) -> 
         else "active"
     )
     parameterized: bool | None = ".each" in chain
-    if not parameterized and (title is None or re.search(r"\b(?:for|while)\s*\(|\.forEach\s*\(", arguments)):
+    if not parameterized and title is None:
         parameterized = None
     return {
         "kind": kind, "framework": None, "line": _line(source, match.start()),
         "name": title, "status": status, "status_source": "declaration",
         "parameterized": parameterized,
+        "body_iteration": bool(re.search(r"\b(?:for|while)\s*\(|\.forEach\s*\(", arguments)),
         "evidence": match.group(0).strip(), "_start": match.start(), "_end": end,
         "_body": arguments,
     }
@@ -352,6 +361,112 @@ def _js_declaration(match: re.Match[str], code: str, source: str, kind: str) -> 
 
 def _evidence(path: str, line: int | None, detail: str) -> dict[str, Any]:
     return {"file": path, "line": line, "detail": detail}
+
+
+def _local_setup(code: str, declaration: dict[str, Any],
+                 declarations: list[dict[str, Any]]) -> str:
+    start = declaration.get("_start")
+    if start is None:
+        return ""
+    suites = [item for item in declarations if item["kind"] == "suite"]
+    enclosing = {item["_start"] for item in suites if item["_start"] < start < item["_end"]}
+    bodies = []
+    for match in re.finditer(r"(?<![\w.$])beforeEach\s*\(", code):
+        scope = {item["_start"] for item in suites if item["_start"] < match.start() < item["_end"]}
+        if not scope.issubset(enclosing):
+            continue
+        end = _closing(code, match.end() - 1)
+        if end is not None:
+            body = code[match.end():end]
+            arrow = body.find("=>")
+            if arrow >= 0:
+                bodies.append(body[arrow + 2:])
+    return "\n".join(bodies)
+
+
+def _pytest_config(content: str, filename: str) -> bool:
+    if filename == "pyproject.toml":
+        return bool(re.search(r"(?m)^\s*\[tool\.pytest\.ini_options\]\s*(?:#.*)?$", content))
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.read_string(content)
+    return parser.has_section("tool:pytest" if filename == "setup.cfg" else "pytest")
+
+
+def _python_declarations(source: str, path: str, configured: bool,
+                         limitations: list[str]) -> list[dict[str, Any]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        limitations.append(f"Invalid Python syntax: {path}:{error.lineno}: {error.msg}")
+        return []
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            aliases.update({item.asname or item.name: item.name for item in node.names if item.name == "pytest"})
+        elif isinstance(node, ast.ImportFrom) and node.module == "pytest" and node.level == 0:
+            aliases.update({item.asname or item.name: f"pytest.{item.name}" for item in node.names})
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    aliases.pop(child.id, None)
+    supported = bool(aliases) or configured
+
+    def qualified(node: ast.AST) -> str:
+        if isinstance(node, ast.Call):
+            return qualified(node.func)
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return f"{qualified(node.value)}.{node.attr}"
+        return ""
+
+    def marks(nodes: list[ast.stmt]) -> list[ast.AST]:
+        result: list[ast.AST] = []
+        for node in nodes:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
+                result.extend(node.value.elts if isinstance(node.value, (ast.List, ast.Tuple)) else [node.value])
+        return result
+
+    declarations: list[dict[str, Any]] = []
+
+    def collect(nodes: list[ast.stmt], inherited: list[ast.AST], prefix: str = "") -> None:
+        for node in nodes:
+            if isinstance(node, ast.ClassDef):
+                if node.name.startswith("Test") and not any(
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "__init__"
+                    for child in node.body
+                ) and not node.bases:
+                    collect(node.body, inherited + node.decorator_list + marks(node.body), node.name + ".")
+                continue
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.name.startswith("test"):
+                continue
+            decorators = inherited + node.decorator_list
+            names = {qualified(decorator) for decorator in decorators}
+            if names & {"pytest.fixture", "pytest.yield_fixture"}:
+                continue
+            status = "skipped" if "pytest.mark.skip" in names else "unknown" if names & {
+                "pytest.mark.skipif", "pytest.mark.xfail"
+            } else "active"
+            if any(isinstance(child, ast.Call) and qualified(child) in {"pytest.skip", "pytest.xfail"}
+                   for statement in node.body for child in ast.walk(statement)):
+                if status != "skipped":
+                    status = "unknown"
+            body = "\n".join(ast.unparse(statement) for statement in node.body)
+            declarations.append({
+                "kind": "test" if supported else "suspected_test",
+                "framework": "pytest" if supported else None,
+                "name": prefix + node.name, "line": node.lineno,
+                "status": status if supported else "unknown",
+                "parameterized": "pytest.mark.parametrize" in names if supported else None,
+                "body_iteration": any(isinstance(child, (ast.For, ast.AsyncFor, ast.While, ast.comprehension))
+                                      for statement in node.body for child in ast.walk(statement)),
+                "evidence": "Python AST test declaration with pytest import/configuration evidence" if supported else "Python AST test-like declaration",
+                "_body": _mask_strings(body),
+            })
+
+    collect(tree.body, marks(tree.body))
+    return declarations
 
 
 def _framework_entry(key: str, metadata: tuple[str, str, list[str], str], evidence: list[dict[str, Any]],
@@ -405,7 +520,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
             for config_names in CONFIG_HINTS.values()
             for config_name in config_names
         )
-        if path.suffix.lower() not in SOURCE_SUFFIXES | {".csproj", ".sln", ".slnx"} and path.name != "package.json" and not is_runner_config:
+        if path.suffix.lower() not in SOURCE_SUFFIXES | {".csproj", ".sln", ".slnx"} and path.name != "package.json" and basename not in PYTEST_CONFIGS and not is_runner_config:
             continue
         try:
             if path.stat().st_size > 1_000_000:
@@ -418,6 +533,12 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
 
     for relative, content in texts.items():
         lower_path = relative.lower()
+        if Path(relative).name.lower() in PYTEST_CONFIGS:
+            try:
+                if _pytest_config(content, Path(relative).name.lower()):
+                    manifest_frameworks.setdefault("pytest", []).append(_evidence(relative, None, "Static pytest configuration section"))
+            except configparser.Error as error:
+                limitations.append(f"Invalid Python test configuration {relative}: {error}")
         if Path(relative).name == "package.json":
             try:
                 manifest = json.loads(content)
@@ -468,7 +589,11 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
             masked = _mask_inactive_csharp(masked)
         code = _mask_strings(masked)
         imports: list[str] = []
-        if ext == ".cs":
+        if ext == ".py":
+            parents = [Path(relative).parent, *Path(relative).parent.parents]
+            configured = any(Path(e["file"]).parent in parents for e in manifest_frameworks.get("pytest", []))
+            declarations = _python_declarations(raw, relative, configured, limitations)
+        elif ext == ".cs":
             code = _mask_inactive_csharp(code)
             declarations: list[dict[str, Any]] = []
             csharp_declarations: dict[tuple[int, str], dict[str, Any]] = {}
@@ -582,10 +707,14 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         test_like = any(token in text_name for token in ("test", "spec", "checks")) or any(
             part.lower() in {"test", "tests", "__tests__", "spec", "specs"} for part in Path(relative).parts
         )
+        if not declarations and (relative in config_framework_keys or text_name in PYTEST_CONFIGS or text_name == "conftest.py"):
+            continue
         if not declarations and not test_like:
             continue
 
-        if ext == ".cs":
+        if ext == ".py":
+            used_keys = sorted({d["framework"] for d in declarations if d["framework"]})
+        elif ext == ".cs":
             used_keys = sorted({item["framework"] for item in declarations if item["kind"] == "test"})
         elif ext in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
             has_test_declaration = any(item["kind"] == "test" for item in declarations)
@@ -609,11 +738,14 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
             for key, metadata in JS_FRAMEWORKS.items():
                 if any(re.search(rf"""(?:from\s*|require\s*\()\s*['"]{re.escape(pkg)}['"]""", masked, re.I) for pkg in metadata[2]):
                     imports.append(key)
+                    if key in AUTOMATION_TOOLS:
+                        all_framework_evidence.setdefault(key, []).append(_evidence(relative, None, "Explicit browser automation tool import"))
+            declared_js.difference_update(AUTOMATION_TOOLS)
             if has_test_declaration and imports:
-                runners = set(imports) - {"selenium-js", "puppeteer"}
+                runners = set(imports) - AUTOMATION_TOOLS
                 if not runners:
                     runners = declared_js & {"mocha", "jest", "vitest", "jasmine"}
-                used_keys = sorted(runners or set(imports))
+                used_keys = sorted(runners)
             elif has_test_declaration and len(declared_js) == 1:
                 used_keys = sorted(declared_js)
             elif has_test_declaration:
@@ -636,7 +768,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                     item["framework"] = selected
         framework_names = []
         for key in used_keys:
-            metadata = DOTNET_FRAMEWORKS.get(key) or JS_FRAMEWORKS.get(key)
+            metadata = FRAMEWORKS.get(key)
             if metadata:
                 framework_names.append(metadata[0])
                 all_framework_evidence.setdefault(key, []).append(_evidence(relative, None, "Recognized test API or attribute"))
@@ -648,16 +780,33 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
             declaration.setdefault("parameterized", None)
             declaration.setdefault("status_source", "declaration")
             body = declaration.pop("_body", "")
+            declaration.setdefault("body_iteration", bool(re.search(r"\b(?:for|foreach|while)\s*\(", body)))
             category, evidence = _classify(body, used_keys) if body else ("unknown", [])
+            basis = "direct" if evidence else "unknown"
+            if category == "unknown" and body and declaration["kind"] == "test":
+                setup = _local_setup(code, declaration, declarations)
+                if setup and _isolated_assertions((setup + "\n" + body).lower()):
+                    category = "unit"
+                    evidence = ["Closed local computation/assertions with lexically enclosing beforeEach setup"]
+                    basis = "inferred_setup"
             declaration["category"] = category
             declaration["classification_evidence"] = evidence
+            declaration["classification_basis"] = basis
             declaration["confidence"] = "confirmed" if declaration.get("framework") else "unknown"
             declaration["tools"] = sorted(set(imports) & {"selenium-js", "puppeteer"})
             identity = f"{relative}::{declaration['kind']}::{declaration['name'] or '@' + str(declaration['line'])}"
             identities[identity] = identities.get(identity, 0) + 1
             declaration["id"] = f"{identity}::{identities[identity]}"
+        for declaration in declarations:
             declaration.pop("_start", None)
             declaration.pop("_end", None)
+        if ext == ".py":
+            categories = {d["category"] for d in declarations}
+            classified = next(iter(categories)) if len(categories) == 1 else "unknown"
+            category_evidence = sorted({
+                evidence for d in declarations for evidence in d["classification_evidence"]
+                if d["category"] == classified
+            })
         if any(d["kind"] == "suspected_test" for d in declarations):
             limitations.append(f"Unsupported framework syntax retained as suspected declarations: {relative}")
         if len(used_keys) > 1:
@@ -686,7 +835,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         })
 
     for key, evidence in all_framework_evidence.items():
-        metadata = DOTNET_FRAMEWORKS.get(key) or JS_FRAMEWORKS.get(key)
+        metadata = FRAMEWORKS.get(key)
         if not metadata:
             continue
         active_files = sorted({item["path"] for item in test_files if any(definition.get("framework") == key for definition in item["definitions"])})
@@ -715,6 +864,10 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
 
     summary = {
         "test_file_count": len(test_files),
+        "recognized_test_file_count": sum(item["test_definition_count"] > 0 for item in test_files),
+        "suspected_test_file_count": sum(item["suspected"] for item in test_files),
+        "unknown_framework_file_count": sum(item["frameworks"] == ["Unknown"] for item in test_files),
+        "unknown_category_file_count": sum(item["category"] == "unknown" for item in test_files),
         "test_definition_count": sum(item["test_definition_count"] for item in test_files),
         "test_suite_count": sum(item["suite_count"] for item in test_files),
         "explicitly_skipped_test_count": sum(item["skipped_test_count"] for item in test_files),
@@ -722,8 +875,28 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         "unknown_or_unclassified_test_file_count": sum(1 for item in test_files if item["category"] == "unknown" or item["suspected"]),
         "classification_counts": {category: sum(1 for item in test_files if item["category"] == category) for category in ("ui_e2e", "component", "unit", "api", "integration", "unknown")},
         "test_project_count": len(test_projects),
-        "framework_count": len(active_frameworks),
+        "framework_count": sum(key not in AUTOMATION_TOOLS for key in active_frameworks),
+        "body_iteration_test_count": sum(
+            d["kind"] == "test" and d["body_iteration"] for file in test_files for d in file["definitions"]
+        ),
+        "framework_parameterized_test_count": sum(
+            d["kind"] == "test" and d["parameterized"] is True for file in test_files for d in file["definitions"]
+        ),
     }
+    automation_tools = []
+    for key, entry in sorted(active_frameworks.items()):
+        if key not in AUTOMATION_TOOLS:
+            continue
+        uses = [(file, d) for file in test_files for d in file["definitions"]
+                if d["kind"] == "test" and key in d["tools"]]
+        automation_tools.append({
+            "name": entry["name"], "language": entry["language"],
+            "confidence": "confirmed" if uses else "probable",
+            "status": "used" if uses else "declared",
+            "test_files": sorted({file["path"] for file, _ in uses}),
+            "associated_definition_count": len(uses),
+            "evidence": entry["evidence"],
+        })
     scan = {
         "scanner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "source_content_sha256": hashlib.sha256(json.dumps(texts, sort_keys=True).encode("utf-8")).hexdigest(),
@@ -743,7 +916,8 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         "repository": {"path": str(root), "identifier": root.name},
         "scan": scan,
         "languages": languages,
-        "frameworks": sorted(active_frameworks.values(), key=lambda item: item["name"].lower()),
+        "frameworks": sorted((entry for key, entry in active_frameworks.items() if key not in AUTOMATION_TOOLS), key=lambda item: item["name"].lower()),
+        "automation_tools": automation_tools,
         "supporting_libraries": [
             {"name": SUPPORT_PACKAGES[key][0], "evidence": evidence}
             for key, evidence in sorted(supporting.items())
@@ -790,10 +964,39 @@ def _classify(masked: str, framework_keys: list[str]) -> tuple[str, list[str]]:
     if re.search(r"\b(?:testserver|webapplicationfactory|testcontainer|databasefixture|integration)\b", code):
         evidence.append("Integration or external-system test indicator")
         return "integration", evidence
-    if re.search(r"\b(?:unit)\b", code):
-        evidence.append("Unit-test path or identifier")
-        return "unit", evidence
+    if _isolated_assertions(code):
+        return "unit", ["Closed local computation/assertions using recognized standard-library operations"]
     return "unknown", evidence
+
+
+def _isolated_assertions(code: str) -> bool:
+    if not re.search(r"\b(?:expect|assert|assert\.\w+)\b", code):
+        return False
+    # Require a closed vocabulary: unresolved services, helpers, fixture arguments,
+    # side effects and unknown calls must not become unit tests by assertion alone.
+    allowed_roots = {
+        "expect", "assert", "string", "system", "is", "has", "times",
+        "new", "var", "const", "let", "true", "false", "null", "none",
+        "throw", "return", "int", "bool", "double", "decimal",
+        "dictionary", "list", "invalidoperationexception",
+    }
+    locals_ = set(re.findall(r"\b(?:var|const|let|string|int|bool|double|decimal)\s+(\w+)\s*=", code))
+    locals_.update(re.findall(r"(?<![\w.])([a-z_]\w*)\s*=(?!=|>)", code))
+    allowed_methods = {
+        "that", "equal", "equalto", "true", "false", "null", "notnull",
+        "isempty", "empty", "single", "contains", "containskey", "getvalueordefault",
+        "startswith", "endswith", "trim", "tolowerinvariant", "toupperinvariant",
+        "isnullorwhitespace", "isnullorempty", "throws",
+        "tobe", "toequal", "tobetruthy", "tobefalsy", "tobedefined", "tobenull",
+        "tobeundefined", "tobegreaterthan", "tocontain", "tohavelength",
+        "tolowercase", "touppercase", "includes", "join",
+    }
+    for call in re.finditer(r"(?P<member>\.)?\s*(?P<name>[a-z_]\w*)\s*(?:<[^<>]*>)?\s*\(", code):
+        name = call.group("name")
+        if name not in (allowed_methods if call.group("member") else allowed_roots):
+            return False
+    roots = re.findall(r"(?<![\w.])([a-z_]\w*)", code)
+    return all(name in allowed_roots | locals_ or name in {"length"} for name in roots)
 
 
 def _render_markdown(data: dict[str, Any]) -> str:
@@ -809,8 +1012,14 @@ def _render_markdown(data: dict[str, Any]) -> str:
         f"- Frameworks identified: {', '.join(item['name'] for item in data['frameworks']) or 'None'}", "",
         "## Test Inventory Summary", "",
         f"- Test files: {summary['test_file_count']}",
+        f"- Files containing recognized declarations: {summary['recognized_test_file_count']}",
+        f"- Suspected files: {summary['suspected_test_file_count']}",
+        f"- Unknown-framework files: {summary['unknown_framework_file_count']}",
+        f"- Unknown-category files: {summary['unknown_category_file_count']}",
         f"- Recognized test definitions: {summary['test_definition_count']}",
         f"- Recognized suites: {summary['test_suite_count']}",
+        f"- Framework-parameterized definitions: {summary['framework_parameterized_test_count']}",
+        f"- Definitions with body iteration: {summary['body_iteration_test_count']}",
         f"- Test projects: {summary['test_project_count']}",
         f"- Explicitly skipped tests: {summary['explicitly_skipped_test_count']}",
         f"- TODO/pending tests: {summary['todo_or_pending_test_count']}",
@@ -843,6 +1052,18 @@ def _render_markdown(data: dict[str, Any]) -> str:
             lines.append("")
     else:
         lines.extend(["No frameworks identified.", ""])
+    lines.extend(["## Browser Automation Tools", ""])
+    for tool in data["automation_tools"]:
+        lines.extend([
+            f"### {tool['name']}", "",
+            f"- Status: `{tool['status']}`",
+            f"- Test files: {', '.join(tool['test_files']) or 'None'}",
+            f"- Associated definitions (not additional tests): {tool['associated_definition_count']}",
+            "- Evidence:",
+            *[f"  - {_format_evidence(item)}" for item in tool["evidence"]], "",
+        ])
+    if not data["automation_tools"]:
+        lines.extend(["None identified.", ""])
     if data["supporting_libraries"]:
         lines.extend(["### Supporting Libraries", ""])
         for library in data["supporting_libraries"]:
@@ -862,6 +1083,20 @@ def _render_markdown(data: dict[str, Any]) -> str:
             lines.extend(f"- {_format_evidence(evidence)}" for evidence in item["evidence"])
             lines.append(f"- Classification: {item['category']} ({', '.join(item['classification_evidence']) or 'insufficient implementation evidence'})")
             lines.append("")
+            if item["definitions"]:
+                lines.extend([
+                    "| Definition | Kind | Category | Basis | Status | Parameterized | Body iteration |",
+                    "|---|---|---|---|---|---|---|",
+                ])
+                for definition in item["definitions"]:
+                    name = (definition["name"] or "(dynamic name)").replace("|", "\\|").replace("\n", " ")
+                    parameterized = "unknown" if definition["parameterized"] is None else str(definition["parameterized"]).lower()
+                    lines.append(
+                        f"| {name} | {definition['kind']} | {definition['category']} | "
+                        f"{definition['classification_basis']} | {definition['status']} | "
+                        f"{parameterized} | {str(definition['body_iteration']).lower()} |"
+                    )
+                lines.append("")
     else:
         lines.extend(["No test files identified.", ""])
     lines.extend(["## Unknown or Unclassified Assets", ""])
@@ -881,7 +1116,7 @@ def _render_markdown(data: dict[str, Any]) -> str:
         f"- Excluded paths encountered: {', '.join(f'`{path}`' for path in data['scan']['excluded_paths']) or 'None'}.",
         "- Static pattern analysis cannot resolve arbitrary aliases, generated tests, or runtime-dependent configuration.",
         "- Conditional skip expressions and runner-level excluded test-file patterns are not evaluated.",
-        "- Frameworks outside the configured JavaScript/TypeScript and .NET signature sets may remain Unknown.",
+        "- Frameworks outside the configured JavaScript/TypeScript, .NET and pytest signatures may remain Unknown.",
         "", "## Evidence", "",
         "Paths are repository-relative; line numbers identify declaration locations. Framework and classification evidence is listed above. Definitions are static declaration counts, not runtime test cases or executions.", "",
     ])

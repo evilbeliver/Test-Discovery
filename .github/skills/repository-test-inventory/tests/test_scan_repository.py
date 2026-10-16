@@ -66,7 +66,7 @@ test.skip('disabled', async () => {});
         self.assertEqual(data["test_files"][0]["category"], "ui_e2e")
         self.assertEqual(data["summary"]["test_definition_count"], 1)
 
-    def test_jest_does_not_imply_category_and_comments_or_strings_are_not_tests(self) -> None:
+    def test_jest_closed_literal_assertion_and_comments_or_strings_are_not_tests(self) -> None:
         self.write("package.json", '{"devDependencies":{"jest":"1"}}')
         self.write("src/customer.test.js", """
 // test('comment', () => {});
@@ -76,6 +76,7 @@ test('customer is valid', () => { expect(true).toBe(true); });
         data, _ = self.scan()
         self.assertEqual(data["summary"]["test_definition_count"], 1)
         self.assertEqual(data["test_files"][0]["category"], "unknown")
+        self.assertEqual(data["test_files"][0]["definitions"][0]["category"], "unit")
         self.assertEqual(data["frameworks"][0]["status"], "active")
 
     def test_monorepo_frameworks_are_associated_with_nearest_package(self) -> None:
@@ -330,13 +331,177 @@ public void Data(int value) {}
         self.assertIn("linked report", result.stderr)
         self.assertEqual(target.read_bytes(), before)
 
-    def test_body_loop_parameterization_is_indeterminate(self) -> None:
+    def test_body_iteration_is_separate_from_framework_parameterization(self) -> None:
         self.write("package.json", '{"devDependencies":{"jest":"1"}}')
         self.write("tests/loop.test.js", "test('inputs', () => { for (const x of [1, 2]) expect(x).toBeTruthy(); });")
         data, _ = self.scan()
         definition = data["test_files"][0]["definitions"][0]
-        self.assertIsNone(definition["parameterized"])
+        self.assertFalse(definition["parameterized"])
+        self.assertTrue(definition["body_iteration"])
         self.assertEqual(data["summary"]["test_definition_count"], 1)
+
+    def test_pytest_ast_aliases_marks_classes_and_fixture_exclusion(self) -> None:
+        self.write("tests/test_python.py", '''
+import pytest as pt
+from pytest import mark as marker, fixture as fixture_alias
+@fixture_alias
+def test_fixture():
+    return 1
+@marker.parametrize("value", [1, 2])
+def test_data(value):
+    assert value
+@pt.mark.skip(reason="later")
+class TestGroup:
+    def test_member(self):
+        assert True
+    def helper(self):
+        def test_nested():
+            pass
+@pt.mark.skipif(platform_check, reason="conditional")
+async def test_conditional():
+    pass
+def test_runtime():
+    pt.skip("runtime")
+def test_loop():
+    for value in [1, 2]:
+        assert value
+''')
+        data, _ = self.scan()
+        definitions = {d["name"]: d for d in data["test_files"][0]["definitions"]}
+        self.assertEqual(set(definitions), {"test_data", "TestGroup.test_member", "test_conditional", "test_runtime", "test_loop"})
+        self.assertTrue(definitions["test_data"]["parameterized"])
+        self.assertEqual(definitions["TestGroup.test_member"]["status"], "skipped")
+        self.assertEqual(definitions["test_conditional"]["status"], "unknown")
+        self.assertEqual(definitions["test_runtime"]["status"], "unknown")
+        self.assertTrue(definitions["test_loop"]["body_iteration"])
+        self.assertEqual(data["summary"]["test_definition_count"], 5)
+        self.assertEqual(data["frameworks"][0]["name"], "pytest")
+
+    def test_pytest_configuration_survives_include_filter_without_executing(self) -> None:
+        self.write("pyproject.toml", '[tool.pytest.ini_options]\npython_files = ["test_*.py"]\n')
+        self.write("tests/test_configured.py", "def test_configured():\n    assert True\n")
+        self.write("other/test_ambiguous.py", "def test_ambiguous():\n    assert True\n")
+        data, _ = self.scan("--include", "tests/*.py")
+        self.assertEqual(data["summary"]["test_definition_count"], 1)
+        self.assertEqual([f["path"] for f in data["test_files"]], ["tests/test_configured.py"])
+
+    def test_invalid_python_is_reported_and_nested_helpers_are_not_tests(self) -> None:
+        self.write("tests/test_broken.py", "import pytest\ndef test_broken(:\n")
+        self.write("tests/test_helpers.py", "import pytest\ndef helper():\n    def test_nested(): pass\n")
+        data, _ = self.scan()
+        self.assertEqual(data["summary"]["test_definition_count"], 0)
+        self.assertTrue(any("Invalid Python syntax" in limitation for limitation in data["limitations"]))
+
+    def test_pytest_ini_and_module_marks(self) -> None:
+        self.write("pytest.ini", "[pytest]\n")
+        self.write("tests/test_module.py", "import pytest\npytestmark = pytest.mark.skip\n"
+                   "def test_disabled():\n    assert True\n")
+        data, _ = self.scan()
+        self.assertEqual(data["summary"]["explicitly_skipped_test_count"], 1)
+
+    def test_python_classes_fixtures_and_literals_do_not_create_extra_tests(self) -> None:
+        self.write("test_negative.py", '''
+import pytest
+description = "def test_fake(): pass"
+class TestConstructed:
+    def __init__(self): pass
+    def test_not_collected(self): pass
+class TestInherited(Base):
+    def test_unresolved(self): pass
+@pytest.fixture
+def test_fixture(): pass
+@pytest.mark.parametrize("value", [
+    pytest.param(1, marks=pytest.mark.skip),
+    pytest.param(2),
+])
+def test_rows(value):
+    assert value
+''')
+        data, _ = self.scan()
+        definitions = data["test_files"][0]["definitions"]
+        self.assertEqual([d["name"] for d in definitions], ["test_rows"])
+        self.assertEqual(definitions[0]["status"], "active")
+        self.assertTrue(definitions[0]["parameterized"])
+
+    def test_pytest_configuration_is_local_and_malformed_ini_is_visible(self) -> None:
+        self.write("one/setup.cfg", "[tool:pytest]\n")
+        self.write("one/test_supported.py", "def test_supported(): pass\n")
+        self.write("two/test_unknown.py", "def test_unknown(): pass\n")
+        self.write("broken/pytest.ini", "[not closed\n")
+        data, _ = self.scan()
+        by_path = {file["path"]: file for file in data["test_files"]}
+        self.assertFalse(by_path["one/test_supported.py"]["suspected"])
+        self.assertTrue(by_path["two/test_unknown.py"]["suspected"])
+        self.assertTrue(any("Invalid Python test configuration" in limitation for limitation in data["limitations"]))
+
+    def test_python_floor_division_is_not_mistaken_for_a_comment(self) -> None:
+        self.write("test_division.py", "import pytest\n"
+                   "def test_unknown():\n    assert 2 // service.load()\n"
+                   "def test_literal():\n    assert 4 // 2 == 2  # service.load()\n")
+        data, _ = self.scan()
+        definitions = data["test_files"][0]["definitions"]
+        self.assertEqual([d["category"] for d in definitions], ["unknown", "unit"])
+
+    def test_shadowed_pytest_alias_does_not_prove_framework(self) -> None:
+        self.write("test_shadow.py", "import pytest as pt\npt = object()\ndef test_unknown(): pass\n")
+        data, _ = self.scan()
+        self.assertEqual(data["summary"]["test_definition_count"], 0)
+
+    def test_configs_are_context_only_unless_they_contain_declarations(self) -> None:
+        self.write("vitest.config.ts", "export default {};")
+        self.write("nested/vitest.config.ts", "import { test } from 'vitest'; test('actual', () => {});")
+        data, _ = self.scan()
+        self.assertEqual([f["path"] for f in data["test_files"]], ["nested/vitest.config.ts"])
+        self.assertEqual(data["summary"]["recognized_test_file_count"], 1)
+        self.assertEqual(data["summary"]["suspected_test_file_count"], 0)
+
+    def test_closed_assertions_and_enclosing_setup_do_not_leak_to_siblings(self) -> None:
+        self.write("package.json", '{"devDependencies":{"jest":"1"}}')
+        self.write("test_classification.js", """
+describe('one', () => {
+  let value;
+  beforeEach(() => { value = 1; });
+  test('local setup', () => { expect(value).toBe(1); });
+});
+describe('two', () => {
+  test('unresolved', () => { expect(value).toBe(1); });
+  test('external', () => { expect(service.load()).toBe(1); });
+  test('literal', () => { expect([1, 2].includes(1)).toBe(true); });
+  test('api', () => { client.get('/'); });
+  test('component', () => { render(Widget); });
+  test.todo('pending');
+});
+""")
+        data, _ = self.scan()
+        tests = {d["name"]: d for d in data["test_files"][0]["definitions"] if d["kind"] == "test"}
+        self.assertEqual(tests["local setup"]["category"], "unit")
+        self.assertEqual(tests["local setup"]["classification_basis"], "inferred_setup")
+        self.assertEqual(tests["unresolved"]["category"], "unknown")
+        self.assertEqual(tests["external"]["category"], "unknown")
+        self.assertEqual(tests["literal"]["category"], "unit")
+        self.assertEqual(tests["api"]["category"], "api")
+        self.assertEqual(tests["component"]["category"], "component")
+        self.assertEqual(tests["pending"]["category"], "unknown")
+
+    def test_tools_are_reported_separately_without_duplicate_definitions(self) -> None:
+        self.write("package.json", '{"devDependencies":{"mocha":"1","selenium-webdriver":"1"}}')
+        self.write("test_browser.js", "const { Builder } = require('selenium-webdriver');"
+                   "it('browser', () => { driver.get('/'); });")
+        data, markdown = self.scan()
+        self.assertEqual([f["name"] for f in data["frameworks"]], ["Mocha"])
+        self.assertEqual(data["automation_tools"][0]["name"], "Selenium WebDriver")
+        self.assertEqual(data["automation_tools"][0]["status"], "used")
+        self.assertEqual(data["automation_tools"][0]["test_files"], ["test_browser.js"])
+        self.assertEqual(data["summary"]["test_definition_count"], 1)
+        self.assertIn("## Browser Automation Tools", markdown)
+
+    def test_browser_tool_import_does_not_prove_runner(self) -> None:
+        self.write("test_tool.js", "const { Builder } = require('selenium-webdriver');"
+                   "test('unknown runner', () => { driver.get('/'); });")
+        data, _ = self.scan()
+        self.assertEqual(data["frameworks"], [])
+        self.assertIsNone(data["test_files"][0]["definitions"][0]["framework"])
+        self.assertEqual(data["automation_tools"][0]["status"], "used")
 
     def test_xunit_theory_is_not_attributed_to_nunit(self) -> None:
         self.write("Tests.cs", "using Xunit;\n[Theory]\n[InlineData(1)] public void Inputs(int x) {}")

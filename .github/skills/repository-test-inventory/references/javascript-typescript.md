@@ -20,4 +20,15 @@ Ignore member `.test()` calls and locally declared conventional helper functions
 
 Static pattern recognition cannot resolve arbitrary aliases, dynamic imports, macro-generated tests, or executable configuration. Such evidence is reported as uncertain rather than evaluated by running Node.js or a framework CLI.
 
-`.each(...)` contributes one parameterized declaration. Loops inside a body are indeterminate parameterization, not extra definitions. Skipped suites propagate skip status; `xit`/`xtest` are skipped and callback-free declarations are pending. Inline runtime skip/fixme status is unknown when recognized. Lexical helper-shadow detection is file-wide rather than a complete scope resolver.
+`.each(...)` contributes one framework-parameterized declaration. Body loops set
+`body_iteration`, not `parameterized`; incidental loops are not proof of
+data-driven testing and never add definitions. Dynamic titles may still leave
+parameterization indeterminate. Skipped suites propagate skip status;
+`xit`/`xtest` are skipped and callback-free declarations are pending.
+Inline runtime skip/fixme status is unknown when recognized.
+Lexical helper-shadow detection is file-wide rather than a complete scope resolver.
+
+Selenium WebDriver and Puppeteer appear in `automation_tools`, not runner totals.
+Their explicit imports are source-use evidence. A tool import alone does not
+establish a test runner. Definition `tools` preserves attribution without counting
+a Mocha declaration twice.

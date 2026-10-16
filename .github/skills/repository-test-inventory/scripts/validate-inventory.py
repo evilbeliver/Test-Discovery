@@ -19,6 +19,7 @@ FRAMEWORKS = {
     "nunit": "NUnit", "xunit": "xUnit", "mstest": "MSTest",
     "testcafe": "TestCafe", "selenium-js": "Selenium WebDriver",
     "webdriverio": "WebdriverIO", "puppeteer": "Puppeteer", "protractor": "Protractor",
+    "pytest": "pytest",
 }
 
 
@@ -55,6 +56,8 @@ def adapt_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
                 record["status"] = {"todo": "pending"}.get(item["status"], item["status"])
             if "parameterized" in item:
                 record["parameterized"] = item["parameterized"]
+            if "body_iteration" in item:
+                record["body_iteration"] = item["body_iteration"]
             definitions.append(record)
     summary = {
         "total_definitions": len(definitions),

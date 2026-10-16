@@ -6,6 +6,8 @@
 
 ## Framework Inventory
 
+## Browser Automation Tools
+
 ## Testing Classification
 
 ## Test File Inventory

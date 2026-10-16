@@ -21,6 +21,7 @@ The adapter emits `repository-test-inventory-adapter/1` with top-level `definiti
 | `status == todo` | `pending` |
 | Other status | Unchanged, including `unknown` |
 | `parameterized` | Boolean or null (indeterminate) |
+| `body_iteration` | Optional additive syntactic iteration evidence; retained separately, never coerced into parameterization |
 | Suspected file | Structured unknown asset |
 | Encountered excluded path | Structured excluded asset; directory pruning covers descendants |
 
@@ -36,6 +37,7 @@ Missing source names make discovery unverifiable, not an empty successful invent
 
 - Discovery reports TP/FP/FN and precision/recall/F1 for the complete baseline.
 - Unsupported frameworks remain false negatives in full-baseline metrics. A separate supported-scope denominator is reported; it never replaces full-baseline results.
+- Supported framework scope includes pytest. Python without explicit pytest evidence remains suspected, not automatically supported by naming.
 - Framework, category, status, and parameterization comparisons use matched definitions only. Missing definitions are not counted as correctly classified.
 - Unknown/null predictions are measured abstentions and fail an exact required comparison. Absent fields make it unverifiable.
 - With no matches, dimension checks are not applicable if discovery is assessable; they are not evidence of successful attribution.
@@ -43,6 +45,23 @@ Missing source names make discovery unverifiable, not an empty successful invent
 - Expected excluded assets must be covered by an encountered exclusion and absent from recognized definitions. Additional exclusions are allowed and remain visible in the inventory.
 - A completed scan, assessable data, and passed validation are separate booleans. All-unverifiable or partially unverifiable outcomes cannot pass.
 - Exit codes: 0 pass; 1 assessable non-pass; 2 input/I/O/contract error; 3 unverifiable required checks.
+
+## Combined workflow
+
+`scripts/scan-and-validate.py` accepts a repository, `--expected`, a fresh external
+`--output-directory`, and scanner include/exclude options. It invokes only the
+bundled scanner and validator, never target code. `workflow-summary.json` retains
+stage commands, exit codes, elapsed timings, Python version, script/baseline
+hashes, source scan provenance, report paths and validation metrics. It refuses
+to overwrite nonempty output directories. Scanner failure stops validation;
+validator non-pass and unverifiable results keep their distinct nonzero exits.
+Input/I/O errors are explicit errors, not successful empty inventories.
+
+Framework parameterization is declaration-driven. A baseline treating a body
+loop as parameterization can therefore disagree with the scanner's false
+prediction even while `body_iteration` is true. Preserve and explain that
+semantic disagreement; do not edit the independent baseline or normalize it
+away to get a pass. Body iteration is not a required comparison in legacy baselines.
 
 ## Independent validator limitations
 

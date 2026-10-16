@@ -12,6 +12,14 @@ Report declared frameworks independently from frameworks actively used in recogn
 
 Assign a primary category only when implementation evidence supports it. Use UI / End-to-End for browser automation, Component for component-testing libraries or component-focused render APIs, API for explicit HTTP/API request tests, Integration for explicit external-system or multi-component integration evidence, Unit for clearly isolated unit-test evidence, otherwise Unknown. A framework name alone does not establish the category. Evidence and category are static heuristics, not quality judgments.
 
+Closed assertions over local values and recognized standard-library operations
+can establish Unit; unresolved services, imports, fixture arguments and mocks do
+not. JS arrow `beforeEach` hooks can provide bounded, lexically enclosing setup
+evidence. Never use a sibling suite's setup. Record `classification_basis` as
+`direct`, `inferred_setup`, or `unknown`; this is not transitive dependency
+analysis. Pending/body-less definitions remain unknown. Measure category coverage
+and wrong predictions separately, rather than maximizing labels at any cost.
+
 ## Skips and exclusions
 
 Keep explicit skips, TODO/pending declarations, conditional skips, excluded files, and unknown execution status distinct. The current scanner counts explicit declaration-level skip markers and TODO/pending forms; it does not resolve conditional skip logic or runner-level file exclusion patterns. Configuration-based file exclusion is evidence only when it can be read without executing configuration. Never infer that a test is disabled merely because no runner config references it.
@@ -23,6 +31,12 @@ Skipped JS suites propagate status to enclosed declarations. `xit` and `xtest` m
 The Markdown and JSON files are rendered from the same model. Paths are repository-relative. Evidence line numbers refer to the inspected source line. Test-file totals count identified or suspected test source files; definition totals count distinct recognized declaration sites once, including a parameterized declaration once. Suite counts are reported only for recognized suite declarations. Skipped counts are a subset of definitions; TODO/pending counts are reported separately. Classifications count test files by their primary category.
 
 The JSON contract is documented in `README.md`. Stable enum values are lowercase `confirmed`, `probable`, `unknown` for confidence and `ui_e2e`, `component`, `unit`, `api`, `integration`, `unknown` for categories.
+
+Separate recognized/suspected file counts and unknown-framework/unknown-category
+counts. These populations overlap and must not be added as disjoint totals.
+Report browser tools separately from runners, preserving source evidence without
+duplicating definitions. `body_iteration` means syntactic repetition, not proof
+of framework parameterization or data-driven testing.
 
 See [validation contract](./validation-contract.md) for independent discovery, attribution, classification, status, and parameterization measurements. Unknown framework and unknown category are different evidence gaps; report them separately.
 
