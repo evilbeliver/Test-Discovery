@@ -1,0 +1,29 @@
+# macOS metadata
+.DS_Store
+._*
+.AppleDouble/
+.LSOverride
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.tox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local coverage output
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated reports (keep the tracked Markdown template)
+inventory-output/
+test-inventory.json
+adapted-inventory.json
+validation-result.json
+validation-report.md
+inventory-report.md
+!.github/skills/repository-test-inventory/templates/inventory-report.md

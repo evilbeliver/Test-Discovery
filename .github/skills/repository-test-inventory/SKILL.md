@@ -21,9 +21,12 @@ Create an evidence-backed inventory of automated testing assets in a local repos
    Optional arguments include `--output-directory`, repeated `--include` and `--exclude` patterns, `--no-default-excludes`, and `--verbose`. Output is always outside the scanned repository.
 4. Read both generated reports. They are derived from the same inventory model.
 5. Summarize the frameworks, test assets, classifications, unknowns, and limitations. Do not claim tests execute, infer runtime test counts, or overstate confidence beyond the report's static evidence.
+6. When an independent baseline is supplied, use the bundled `scripts/validate-inventory.py` as described in [validation contract](./references/validation-contract.md). Keep its outputs outside the target. Distinguish scan completion, assessability, and validation passing. Nonzero comparison results are not scanner failures, and an all-unverifiable result is never a pass.
 
 ## Interpretation
 
 The scanner is a static inventory tool, not a test runner, quality assessment, or coverage analyzer. Counts describe statically recognized declarations, not runtime cases or executions. Use `Unknown` when source evidence does not support a stronger conclusion.
 
 See [README](./README.md) for usage, output schema, and extension guidance.
+
+Python/pytest functions are suspected assets, not supported-framework definitions. Runner collection patterns and `.gitignore` are not applied. Record explicit exclusion arguments; do not infer exclusions from a baseline's omission of a file.

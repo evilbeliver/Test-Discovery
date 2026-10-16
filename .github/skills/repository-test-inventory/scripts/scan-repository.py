@@ -68,11 +68,11 @@ SUPPORT_PACKAGES = {
     "bunit": ("bUnit", ["bunit"]),
 }
 JS_DECLARATION = re.compile(
-    r"\b(?P<name>test|it|specify|xit|fit|xtest)\b"
+    r"(?<![\w.$])(?P<name>test|it|specify|xit|fit|xtest)\b"
     r"(?P<chain>(?:\s*\.\s*(?:skip|only|todo|each|concurrent|fails|cb))*)"
     r"\s*\(",
 )
-JS_SUITE = re.compile(r"\b(?P<name>describe|context|suite|xdescribe|fdescribe)\b(?P<chain>(?:\s*\.\s*(?:skip|only|each))*)\s*\(")
+JS_SUITE = re.compile(r"(?<![\w.$])(?:test\s*\.\s*)?(?P<name>describe|context|suite|xdescribe|fdescribe)\b(?P<chain>(?:\s*\.\s*(?:skip|only|each))*)\s*\(")
 CS_ATTRIBUTE = re.compile(
     r"\[(?P<attribute>TestMethod|DataTestMethod|Fact|Theory|Test|TestCase|TestCaseSource)"
     r"\b(?P<arguments>[^\]]*)\]",
@@ -287,6 +287,69 @@ def _line(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
+def _closing(code: str, opening: int) -> int | None:
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    for position in range(opening, len(code)):
+        char = code[position]
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in ")]}":
+            if not stack or stack.pop() != char:
+                return None
+            if not stack:
+                return position
+    return None
+
+
+def _js_declaration(match: re.Match[str], code: str, source: str, kind: str) -> dict[str, Any] | None:
+    prefix = code[:match.start()].rstrip()
+    if prefix.endswith((".", "?.")) or re.search(r"\bfunction\s*\*?\s*$", prefix):
+        return None
+    # A locally declared helper shadows the conventional global test API.
+    name = match.group("name")
+    if re.search(rf"\bfunction\s+{name}\s*\(|\b(?:const|let|var)\s+{name}\s*=", code):
+        return None
+    chain = re.sub(r"\s+", "", match.group("chain"))
+    opening = match.end() - 1
+    end = _closing(code, opening)
+    if end is None:
+        return None
+    if ".each" in chain:
+        next_call = re.match(r"\s*\(", code[end + 1:])
+        if not next_call:
+            return None
+        opening = end + next_call.end()
+        end = _closing(code, opening)
+        if end is None:
+            return None
+    literal = re.match(r"""\s*(?P<quote>['"`])(?P<title>(?:\\.|[^\\])*?)(?P=quote)""", source[opening + 1:end], re.S)
+    title = literal.group("title") if literal else None
+    if title is not None:
+        title = re.sub(r"""\\(['"\\`])""", r"\1", title)
+        if literal.group("quote") == "`" and "${" in title:
+            title = None
+    arguments = code[opening + 1:end]
+    callback = "=>" in arguments or bool(re.search(r"\bfunction\b", arguments))
+    if title is None and not callback:
+        return None
+    status = (
+        "skipped" if ".skip" in chain or name in {"xit", "xtest", "xdescribe"}
+        else "todo" if ".todo" in chain or (kind == "test" and not callback)
+        else "active"
+    )
+    parameterized: bool | None = ".each" in chain
+    if not parameterized and (title is None or re.search(r"\b(?:for|while)\s*\(|\.forEach\s*\(", arguments)):
+        parameterized = None
+    return {
+        "kind": kind, "framework": None, "line": _line(source, match.start()),
+        "name": title, "status": status, "status_source": "declaration",
+        "parameterized": parameterized,
+        "evidence": match.group(0).strip(), "_start": match.start(), "_end": end,
+        "_body": arguments,
+    }
+
+
 def _evidence(path: str, line: int | None, detail: str) -> dict[str, Any]:
     return {"file": path, "line": line, "detail": detail}
 
@@ -320,7 +383,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         output_dir = Path(output_arg).expanduser().resolve()
     else:
         digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
-        output_dir = Path(tempfile.gettempdir()) / "repository-test-inventory" / digest
+        output_dir = (Path(tempfile.gettempdir()) / "repository-test-inventory" / digest).resolve()
     if _inside(output_dir, root):
         raise ValueError("Output directory must be outside the scanned repository.")
 
@@ -404,22 +467,32 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         if ext == ".cs":
             masked = _mask_inactive_csharp(masked)
         code = _mask_strings(masked)
+        imports: list[str] = []
         if ext == ".cs":
             code = _mask_inactive_csharp(code)
             declarations: list[dict[str, Any]] = []
             csharp_declarations: dict[tuple[int, str], dict[str, Any]] = {}
             for match in CS_ATTRIBUTE.finditer(code):
                 attribute = match.group("attribute")
-                key = next((k for k, (_, _, _, pattern) in DOTNET_FRAMEWORKS.items() if re.fullmatch(pattern, f"[{attribute}]", re.I)), None)
+                if attribute.lower() == "theory":
+                    project = _nearest_project(root / relative, projects, root)
+                    candidates = {
+                        framework for framework in ("nunit", "xunit")
+                        if any(e["file"] == project for e in manifest_frameworks.get(framework, []))
+                    }
+                    if re.search(r"\busing\s+Xunit\s*;", code):
+                        key = "xunit"
+                    elif re.search(r"\busing\s+NUnit\.Framework\s*;", code):
+                        key = "nunit"
+                    else:
+                        key = next(iter(candidates)) if len(candidates) == 1 else None
+                    if key is None:
+                        limitations.append(f"Ambiguous [Theory] framework: {relative}:{_line(masked, match.start())}")
+                        continue
+                else:
+                    key = next((k for k, (_, _, _, pattern) in DOTNET_FRAMEWORKS.items() if re.fullmatch(pattern, f"[{attribute}]", re.I)), None)
                 if not key:
                     key = "nunit" if attribute.lower() in {"test", "testcase", "testcasesource"} else "xunit" if attribute.lower() in {"fact", "theory"} else "mstest"
-                preceding_attributes = code[max(0, match.start() - 200):match.start()]
-                following_attributes = code[match.end():match.end() + 200]
-                skipped = bool(
-                    re.search(r"\b(?:Skip|Ignore)\s*=", match.group("arguments"), re.I)
-                    or re.search(r"\[\s*Ignore\b[^\]]*\]\s*$", preceding_attributes, re.I)
-                    or re.search(r"\[\s*Ignore\b[^\]]*\]", following_attributes, re.I)
-                )
                 following_method = code[match.end():match.end() + 500]
                 method = re.search(
                     r"\b(?:public|private|protected|internal)\s+"
@@ -427,14 +500,36 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                     r"(?:[\w.<>,?\[\]]+\s+)+(?P<name>\w+)\s*\(",
                     following_method,
                 )
+                if not method:
+                    limitations.append(f"Could not resolve attributed test method: {relative}:{_line(masked, match.start())}")
+                    continue
+                preceding = re.search(r"(?:\[[^\]]*\]\s*)+$", code[:match.start()])
+                attributes = (preceding.group(0) if preceding else "") + code[
+                    match.start():match.end() + method.start()
+                ]
+                skipped = bool(re.search(r"\bSkip\s*=|\bIgnore\s*(?:\(|\])", attributes, re.I))
                 declaration_offset = match.end() + method.start() if method else match.start()
                 declaration_key = (declaration_offset, key)
+                method_end = match.end() + method.end()
+                opening = code.find("{", method_end)
+                expression = code.find("=>", method_end)
+                if expression >= 0 and (opening < 0 or expression < opening):
+                    end = code.find(";", expression)
+                    body = code[expression:end] if end >= 0 else ""
+                elif opening >= 0:
+                    end = _closing(code, opening)
+                    body = code[opening:end] if end is not None else ""
+                else:
+                    body = ""
                 declaration = {
                     "kind": "test",
                     "framework": key,
+                    "name": method.group("name"),
                     "line": _line(masked, match.start()),
                     "status": "skipped" if skipped else "active",
+                    "parameterized": bool(re.search(r"\b(?:Theory|TestCase|TestCaseSource|DataTestMethod|DataRow|DynamicData)\b", attributes, re.I)),
                     "evidence": f"[{attribute}]",
+                    "_body": body,
                 }
                 existing = csharp_declarations.get(declaration_key)
                 if existing:
@@ -449,39 +544,39 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
             for key, (_, _, _, pattern) in DOTNET_FRAMEWORKS.items():
                 if re.search(pattern, code, re.I) and key in detected_keys:
                     all_framework_evidence.setdefault(key, []).append(_evidence(relative, None, "Test attribute used in source"))
-        else:
+        elif ext in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
             declarations = []
             for match in JS_DECLARATION.finditer(code):
-                chain = match.group("chain").replace(" ", "").replace("\t", "")
-                status = "todo" if ".todo" in chain or match.group("name") in {"xit", "xtest"} else "skipped" if ".skip" in chain else "active"
-                declarations.append({
-                    "kind": "test",
-                    "framework": None,
-                    "line": _line(masked, match.start()),
-                    "status": status,
-                    "evidence": match.group(0).strip(),
-                })
-            suite_matches = list(JS_SUITE.finditer(code))
-            for match in suite_matches:
-                chain = match.group("chain").replace(" ", "").replace("\t", "")
-                declarations.append({
-                    "kind": "suite",
-                    "framework": None,
-                    "line": _line(masked, match.start()),
-                    "status": "todo" if match.group("name") in {"xdescribe"} else "skipped" if ".skip" in chain else "active",
-                    "evidence": match.group(0).strip(),
-                })
-            if ext not in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
-                unknown_pattern = UNKNOWN_DECLARATIONS.get(ext)
-                if unknown_pattern:
-                    for match in unknown_pattern.finditer(code):
-                        declarations.append({
-                            "kind": "suspected_test",
-                            "framework": None,
-                            "line": _line(masked, match.start()),
-                            "status": "unknown",
-                            "evidence": match.group(0).strip() or "Framework-neutral test declaration marker",
-                        })
+                declaration = _js_declaration(match, code, masked, "test")
+                if declaration:
+                    declarations.append(declaration)
+            for match in JS_SUITE.finditer(code):
+                declaration = _js_declaration(match, code, masked, "suite")
+                if declaration:
+                    declarations.append(declaration)
+            for declaration in declarations:
+                if any(
+                    suite["kind"] == "suite" and suite["status"] == "skipped"
+                    and suite["_start"] < declaration["_start"] < suite["_end"]
+                    for suite in declarations
+                ):
+                    declaration["status"] = "skipped"
+                    declaration["status_source"] = "enclosing_suite"
+                if declaration["kind"] == "test" and declaration["status"] != "skipped" and re.search(r"\btest\s*\.\s*(?:skip|fixme)\s*\(", declaration["_body"]):
+                    declaration["status"] = "unknown"
+                    declaration["status_source"] = "conditional_or_runtime"
+        else:
+            declarations = []
+            unknown_pattern = UNKNOWN_DECLARATIONS.get(ext)
+            if unknown_pattern:
+                for match in unknown_pattern.finditer(code):
+                    declarations.append({
+                        "kind": "suspected_test", "framework": None,
+                        "name": match.groupdict().get("name"),
+                        "line": _line(masked, match.start()), "status": "unknown",
+                        "parameterized": None,
+                        "evidence": match.group(0).strip() or "Framework-neutral test declaration marker",
+                    })
 
         text_name = Path(relative).name.lower()
         test_like = any(token in text_name for token in ("test", "spec", "checks")) or any(
@@ -492,7 +587,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
 
         if ext == ".cs":
             used_keys = sorted({item["framework"] for item in declarations if item["kind"] == "test"})
-        else:
+        elif ext in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
             has_test_declaration = any(item["kind"] == "test" for item in declarations)
             source_path = Path(relative)
             source_parents = [source_path.parent, *source_path.parent.parents]
@@ -511,20 +606,29 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                 declared_js.update(max(local_packages, key=lambda item: item[0])[1])
             if has_test_declaration and local_configs:
                 declared_js.update(max(local_configs, key=lambda item: item[0])[1])
-            imports: list[str] = []
             for key, metadata in JS_FRAMEWORKS.items():
                 if any(re.search(rf"""(?:from\s*|require\s*\()\s*['"]{re.escape(pkg)}['"]""", masked, re.I) for pkg in metadata[2]):
                     imports.append(key)
             if has_test_declaration and imports:
-                used_keys = sorted(set(imports))
+                runners = set(imports) - {"selenium-js", "puppeteer"}
+                if not runners:
+                    runners = declared_js & {"mocha", "jest", "vitest", "jasmine"}
+                used_keys = sorted(runners or set(imports))
             elif has_test_declaration and len(declared_js) == 1:
                 used_keys = sorted(declared_js)
             elif has_test_declaration:
-                matched = [key for key, metadata in JS_FRAMEWORKS.items() if re.search(metadata[3], code)]
+                matched = [
+                    key for key, marker in {
+                        "jest": r"\bjest\.", "vitest": r"\bvi\.", "cypress": r"\bcy\.",
+                        "jasmine": r"\bjasmine\.", "webdriverio": r"\bbrowser\.url\s*\(",
+                    }.items() if re.search(marker, code)
+                ]
                 # Generic assertion and test APIs are not enough to distinguish Jest from Vitest/Mocha.
                 used_keys = sorted(matched) if len(matched) == 1 else []
             else:
                 used_keys = []
+        else:
+            used_keys = []
         if ext != ".cs" and used_keys:
             selected = used_keys[0] if len(used_keys) == 1 else None
             for item in declarations:
@@ -537,6 +641,25 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
                 framework_names.append(metadata[0])
                 all_framework_evidence.setdefault(key, []).append(_evidence(relative, None, "Recognized test API or attribute"))
         classified, category_evidence = _classify(code, used_keys)
+        identities: dict[str, int] = {}
+        for declaration in declarations:
+            declaration["path"] = relative
+            declaration.setdefault("name", None)
+            declaration.setdefault("parameterized", None)
+            declaration.setdefault("status_source", "declaration")
+            body = declaration.pop("_body", "")
+            category, evidence = _classify(body, used_keys) if body else ("unknown", [])
+            declaration["category"] = category
+            declaration["classification_evidence"] = evidence
+            declaration["confidence"] = "confirmed" if declaration.get("framework") else "unknown"
+            declaration["tools"] = sorted(set(imports) & {"selenium-js", "puppeteer"})
+            identity = f"{relative}::{declaration['kind']}::{declaration['name'] or '@' + str(declaration['line'])}"
+            identities[identity] = identities.get(identity, 0) + 1
+            declaration["id"] = f"{identity}::{identities[identity]}"
+            declaration.pop("_start", None)
+            declaration.pop("_end", None)
+        if any(d["kind"] == "suspected_test" for d in declarations):
+            limitations.append(f"Unsupported framework syntax retained as suspected declarations: {relative}")
         if len(used_keys) > 1:
             framework_confidence = "probable"
         elif used_keys:
@@ -602,6 +725,8 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
         "framework_count": len(active_frameworks),
     }
     scan = {
+        "scanner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "source_content_sha256": hashlib.sha256(json.dumps(texts, sort_keys=True).encode("utf-8")).hexdigest(),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mode": "static_read_only",
         "status": "completed_with_limitations" if limitations else "completed",
@@ -614,7 +739,7 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
     }
     languages = sorted({item["language"] for item in test_files if item["language"] != "Unknown"})
     inventory = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "repository": {"path": str(root), "identifier": root.name},
         "scan": scan,
         "languages": languages,
@@ -631,6 +756,9 @@ def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: 
     output_dir.mkdir(parents=True, exist_ok=True)
     md_path = output_dir / "inventory-report.md"
     json_path = output_dir / "test-inventory.json"
+    for report in (md_path, json_path):
+        if report.is_symlink() or (report.exists() and report.stat().st_nlink > 1):
+            raise ValueError(f"Refusing to overwrite a linked report file: {report}")
     json_path.write_text(json.dumps(inventory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     md_path.write_text(_render_markdown(inventory), encoding="utf-8")
     if verbose:
@@ -650,9 +778,8 @@ def _language(ext: str) -> str:
 def _classify(masked: str, framework_keys: list[str]) -> tuple[str, list[str]]:
     code = masked.lower()
     evidence: list[str] = []
-    if (re.search(r"\b(?:page|browser|driver)\.(?:goto|navigate|url|get)\b|\bcy\.visit\b|\bpuppeteer\b|\bselenium\b|\bplaywright\b", code)
-            or "webdriverio" in framework_keys or "protractor" in framework_keys or "testcafe" in framework_keys):
-        evidence.append("Browser automation API or framework reference")
+    if re.search(r"\b(?:page|browser|driver)\.(?:goto|navigate|url|get|locator|getby\w+)\b|\bcy\.visit\b|\bselector\s*\(", code):
+        evidence.append("Browser automation API")
         return "ui_e2e", evidence
     if re.search(r"@testing-library/(?:react|angular)|\b(?:render|rendercomponent|testcontext)\s*\(", code) or "bunit" in code:
         evidence.append("Component render/testing API")
@@ -733,13 +860,19 @@ def _render_markdown(data: dict[str, Any]) -> str:
         for item in data["test_files"]:
             lines.extend([f"### Evidence: `{item['path']}`", ""])
             lines.extend(f"- {_format_evidence(evidence)}" for evidence in item["evidence"])
-            lines.extend(f"- Classification: {item['category']} ({', '.join(item['classification_evidence']) or 'insufficient implementation evidence'})")
+            lines.append(f"- Classification: {item['category']} ({', '.join(item['classification_evidence']) or 'insufficient implementation evidence'})")
             lines.append("")
     else:
         lines.extend(["No test files identified.", ""])
     lines.extend(["## Unknown or Unclassified Assets", ""])
     unknowns = [item for item in data["test_files"] if item["suspected"] or item["category"] == "unknown"]
-    lines.extend([f"- `{item['path']}`: framework/category evidence insufficient; {item['suspected_definition_count']} probable unrecognized declaration site(s)." for item in unknowns] or ["None identified."])
+    lines.extend([
+        f"- `{item['path']}`: "
+        f"{'unknown framework; ' if item['suspected'] else ''}"
+        f"{'unknown category; ' if item['category'] == 'unknown' else ''}"
+        f"{item['suspected_definition_count']} suspected declaration site(s)."
+        for item in unknowns
+    ] or ["None identified."])
     lines.extend(["", "## Scan Limitations", ""])
     lines.extend([f"- {item}" for item in data["limitations"]] or ["- No inaccessible or skipped files were recorded."])
     lines.extend([

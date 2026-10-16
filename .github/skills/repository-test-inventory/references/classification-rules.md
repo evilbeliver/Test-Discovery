@@ -16,8 +16,12 @@ Assign a primary category only when implementation evidence supports it. Use UI 
 
 Keep explicit skips, TODO/pending declarations, conditional skips, excluded files, and unknown execution status distinct. The current scanner counts explicit declaration-level skip markers and TODO/pending forms; it does not resolve conditional skip logic or runner-level file exclusion patterns. Configuration-based file exclusion is evidence only when it can be read without executing configuration. Never infer that a test is disabled merely because no runner config references it.
 
+Skipped JS suites propagate status to enclosed declarations. `xit` and `xtest` mean skipped, not TODO. Callback-free pending forms use `todo`; recognized runtime Playwright skip/fixme calls produce `unknown` status. Other dynamic status mechanisms remain a limitation. File categories and definition-body categories are separate; never copy a primary file category across mixed test definitions.
+
 ## Reports and counts
 
 The Markdown and JSON files are rendered from the same model. Paths are repository-relative. Evidence line numbers refer to the inspected source line. Test-file totals count identified or suspected test source files; definition totals count distinct recognized declaration sites once, including a parameterized declaration once. Suite counts are reported only for recognized suite declarations. Skipped counts are a subset of definitions; TODO/pending counts are reported separately. Classifications count test files by their primary category.
 
 The JSON contract is documented in `README.md`. Stable enum values are lowercase `confirmed`, `probable`, `unknown` for confidence and `ui_e2e`, `component`, `unit`, `api`, `integration`, `unknown` for categories.
+
+See [validation contract](./validation-contract.md) for independent discovery, attribution, classification, status, and parameterization measurements. Unknown framework and unknown category are different evidence gaps; report them separately.
