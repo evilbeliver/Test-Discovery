@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Statically inventory automated test assets without executing repository code."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_EXCLUDES = {
+    ".git", "node_modules", "bin", "obj", "dist", "build", ".next", ".nuxt",
+    "coverage", "vendor", "__pycache__", ".venv", "venv", ".tox",
+}
+CONFIG_HINTS = {
+    "playwright": ("playwright.config.",),
+    "jest": ("jest.config.",),
+    "cypress": ("cypress.config.", "cypress.json"),
+    "vitest": ("vitest.config.",),
+    "mocha": (".mocharc", "mocha.opts"),
+    "webdriverio": ("wdio.conf.",),
+    "protractor": ("protractor.conf.",),
+    "testcafe": ("testcafe.config.",),
+}
+SOURCE_SUFFIXES = {
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".cs",
+    ".py", ".java", ".kt", ".go", ".rb", ".php", ".rs", ".scala", ".swift",
+}
+IGNORED_SUFFIXES = {
+    ".lock", ".map", ".min.js", ".min.css", ".dll", ".exe", ".pdb", ".so",
+    ".dylib", ".class", ".pyc", ".png", ".jpg", ".jpeg", ".gif", ".pdf",
+}
+JS_FRAMEWORKS = {
+    "playwright": ("Playwright", "JavaScript/TypeScript", ["@playwright/test"], r"\b(?:test|expect)\b|\bpage\.(?:goto|click|locator)\b"),
+    "jest": ("Jest", "JavaScript/TypeScript", ["jest"], r"\b(?:jest|expect)\b"),
+    "cypress": ("Cypress", "JavaScript/TypeScript", ["cypress"], r"\bcy\.(?:visit|request|get|contains)\b"),
+    "vitest": ("Vitest", "JavaScript/TypeScript", ["vitest"], r"\b(?:vi|expect)\b"),
+    "mocha": ("Mocha", "JavaScript/TypeScript", ["mocha"], r"\b(?:describe|context|it|beforeEach|afterEach)\b"),
+    "jasmine": ("Jasmine", "JavaScript/TypeScript", ["jasmine"], r"\b(?:jasmine|expect|fit|xit)\b"),
+    "webdriverio": ("WebdriverIO", "JavaScript/TypeScript", ["webdriverio", "@wdio/cli"], r"\b(?:browser|driver)\.(?:url|navigateTo)\b"),
+    "selenium-js": ("Selenium WebDriver", "JavaScript/TypeScript", ["selenium-webdriver"], r"\b(?:webdriver|By)\b"),
+    "puppeteer": ("Puppeteer", "JavaScript/TypeScript", ["puppeteer"], r"\b(?:puppeteer|page)\.(?:launch|goto)\b"),
+    "protractor": ("Protractor", "JavaScript/TypeScript", ["protractor"], r"\b(?:browser\.get|element\(|by\.)"),
+    "testcafe": ("TestCafe", "JavaScript/TypeScript", ["testcafe"], r"\b(?:Selector|fixture)\s*\("),
+}
+DOTNET_FRAMEWORKS = {
+    "nunit": ("NUnit", ".NET", ["nunit", "NUnit.Framework"], r"\[(?:Test|TestCase|TestCaseSource|Theory)\b"),
+    "xunit": ("xUnit", ".NET", ["xunit", "Xunit"], r"\[(?:Fact|Theory|InlineData|MemberData|ClassData)\b"),
+    "mstest": ("MSTest", ".NET", ["MSTest.TestFramework", "Microsoft.VisualStudio.TestTools.UnitTesting"], r"\[(?:TestMethod|DataTestMethod|TestClass|DataRow)\b"),
+}
+SUPPORT_PACKAGES = {
+    "react-testing-library": ("React Testing Library", ["@testing-library/react", "react-testing-library"]),
+    "angular-testing-library": ("Angular Testing Library", ["@testing-library/angular", "@testing-library/jest-angular"]),
+    "enzyme": ("Enzyme", ["enzyme"]),
+    "moq": ("Moq", ["Moq"]),
+    "nsubstitute": ("NSubstitute", ["NSubstitute"]),
+    "fluentassertions": ("FluentAssertions", ["FluentAssertions"]),
+    "selenium-dotnet": ("Selenium WebDriver for .NET", ["Selenium.WebDriver"]),
+    "playwright-dotnet": ("Microsoft Playwright for .NET", ["Microsoft.Playwright"]),
+    "bunit": ("bUnit", ["bunit"]),
+}
+JS_DECLARATION = re.compile(
+    r"\b(?P<name>test|it|specify|xit|fit|xtest)\b"
+    r"(?P<chain>(?:\s*\.\s*(?:skip|only|todo|each|concurrent|fails|cb))*)"
+    r"\s*\(",
+)
+JS_SUITE = re.compile(r"\b(?P<name>describe|context|suite|xdescribe|fdescribe)\b(?P<chain>(?:\s*\.\s*(?:skip|only|each))*)\s*\(")
+CS_ATTRIBUTE = re.compile(
+    r"\[(?P<attribute>TestMethod|DataTestMethod|Fact|Theory|Test|TestCase|TestCaseSource)"
+    r"\b(?P<arguments>[^\]]*)\]",
+    re.IGNORECASE,
+)
+UNKNOWN_DECLARATIONS = {
+    ".py": re.compile(r"^\s*(?:async\s+)?def\s+(?P<name>test\w*)\s*\(", re.MULTILINE),
+    ".go": re.compile(r"^\s*func\s+(?P<name>Test\w+)\s*\(", re.MULTILINE),
+    ".java": re.compile(r"@\s*Test\b"),
+    ".kt": re.compile(r"@\s*Test\b"),
+    ".rs": re.compile(r"#\s*\[\s*test\s*\]"),
+    ".rb": re.compile(r"^\s*def\s+(?P<name>test_\w*)\b", re.MULTILINE),
+}
+
+
+def _mask_comments(text: str, hash_comments: bool = False) -> str:
+    """Replace comments with spaces while retaining string literals and line positions."""
+    chars = list(text)
+    i, length = 0, len(chars)
+    state = "code"
+    quote = ""
+    while i < length:
+        char = chars[i]
+        nxt = chars[i + 1] if i + 1 < length else ""
+        if state == "code":
+            if char in ("'", '"', "`"):
+                quote = char * 3 if char in ("'", '"') and text.startswith(char * 3, i) else char
+                state = "string"
+                i += len(quote) - 1
+            elif char == "/" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "line"
+            elif char == "/" and nxt == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "block"
+            elif char == "#" and (nxt == "!" or hash_comments):
+                chars[i] = " "
+                if nxt == "!":
+                    chars[i + 1] = " "
+                    i += 1
+                state = "line"
+        elif state == "string":
+            if char == "\\":
+                i += 1
+            elif text.startswith(quote, i):
+                state = "code"
+                i += len(quote) - 1
+        elif state == "line":
+            if char == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+        elif state == "block":
+            if char == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "code"
+            elif char != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _mask_inactive_csharp(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    result: list[str] = []
+    inactive_depth = 0
+    for line in lines:
+        directive = re.match(r"\s*#\s*(if|else|elif|endif)\b(.*)", line)
+        if directive:
+            command, expression = directive.group(1), directive.group(2).strip()
+            if command == "if" and expression.lower() in {"false", "0"}:
+                inactive_depth += 1
+            elif command == "endif" and inactive_depth:
+                inactive_depth -= 1
+            elif command in {"else", "elif"} and inactive_depth:
+                inactive_depth -= 1
+            result.append("".join("\n" if c == "\n" else " " for c in line))
+        elif inactive_depth:
+            result.append("".join("\n" if c == "\n" else " " for c in line))
+        else:
+            result.append(line)
+    return "".join(result)
+
+
+def _mask_strings(text: str) -> str:
+    chars = list(text)
+    i = 0
+    quote = ""
+    while i < len(chars):
+        if not quote:
+            if chars[i] in ("'", '"', "`"):
+                character = chars[i]
+                quote = character * 3 if character in ("'", '"') and text.startswith(character * 3, i) else character
+                for offset in range(len(quote)):
+                    chars[i + offset] = " "
+                i += len(quote) - 1
+        else:
+            if chars[i] == "\\":
+                if chars[i] != "\n":
+                    chars[i] = " "
+                if i + 1 < len(chars) and chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                i += 1
+            elif text.startswith(quote, i):
+                delimiter_length = len(quote)
+                for offset in range(len(quote)):
+                    chars[i + offset] = " "
+                quote = ""
+                i += delimiter_length - 1
+            elif chars[i] != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _matches(path: str, pattern: str) -> bool:
+    if fnmatch.fnmatchcase(path, pattern):
+        return True
+    if "/" not in pattern:
+        return any(fnmatch.fnmatchcase(part, pattern) for part in path.split("/"))
+    return False
+
+
+def _include_allows_directory(path: str, patterns: list[str]) -> bool:
+    return any(
+        _matches(path, pattern)
+        or pattern.startswith(path.rstrip("/") + "/")
+        or "/" not in pattern
+        for pattern in patterns
+    )
+
+
+def _excluded(relative: str, patterns: set[str]) -> bool:
+    parts = relative.split("/")
+    return any(_matches(relative, pattern) or any(_matches("/".join(parts[:i]), pattern) for i in range(1, len(parts))) for pattern in patterns)
+
+
+def _inside(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _walk(root: Path, includes: list[str], excludes: list[str], default_excludes: bool,
+          limitations: list[str], excluded_paths: list[str]) -> list[Path]:
+    files: list[Path] = []
+    explicit_excludes = set(excludes)
+    default_patterns = DEFAULT_EXCLUDES if default_excludes else set()
+    def record_walk_error(error: OSError) -> None:
+        limitations.append(f"Could not inspect directory {error.filename or root}: {error.strerror or error}")
+
+    for current, directories, names in os.walk(root, topdown=True, onerror=record_walk_error, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(root).as_posix()
+        if relative_dir == ".":
+            relative_dir = ""
+        retained: list[str] = []
+        for name in sorted(directories):
+            candidate = current_path / name
+            relative = (Path(relative_dir) / name).as_posix() if relative_dir else name
+            if candidate.is_symlink():
+                limitations.append(f"Skipped symbolic link: {relative}")
+            elif _excluded(relative, explicit_excludes):
+                excluded_paths.append(relative)
+                continue
+            elif _excluded(relative, default_patterns) and not _include_allows_directory(relative, includes):
+                excluded_paths.append(relative)
+                continue
+            else:
+                retained.append(name)
+        directories[:] = retained
+        for name in sorted(names):
+            candidate = current_path / name
+            relative = (Path(relative_dir) / name).as_posix() if relative_dir else name
+            if candidate.is_symlink():
+                limitations.append(f"Skipped symbolic link: {relative}")
+                continue
+            if _excluded(relative, explicit_excludes):
+                excluded_paths.append(relative)
+                continue
+            if _excluded(relative, default_patterns) and not any(_matches(relative, p) for p in includes):
+                excluded_paths.append(relative)
+                continue
+            basename = name.lower()
+            context_file = (
+                basename == "package.json"
+                or candidate.suffix.lower() in {".csproj", ".sln", ".slnx"}
+                or any(basename.startswith(config_name) for config_names in CONFIG_HINTS.values() for config_name in config_names)
+            )
+            if includes and not context_file and not any(_matches(relative, pattern) for pattern in includes):
+                continue
+            if candidate.suffix.lower() in IGNORED_SUFFIXES or name.endswith((".min.js", ".min.css")):
+                continue
+            files.append(candidate)
+    return sorted(files, key=lambda p: p.relative_to(root).as_posix())
+
+
+def _nearest_project(path: Path, projects: list[Path], root: Path) -> str | None:
+    parents = [path.parent, *path.parent.parents]
+    candidates = [project for project in projects if project.parent in parents and _inside(project, root)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: len(p.parts)).relative_to(root).as_posix()
+
+
+def _line(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def _evidence(path: str, line: int | None, detail: str) -> dict[str, Any]:
+    return {"file": path, "line": line, "detail": detail}
+
+
+def _framework_entry(key: str, metadata: tuple[str, str, list[str], str], evidence: list[dict[str, Any]],
+                     active: bool) -> dict[str, Any]:
+    name, language, _, _ = metadata
+    return {
+        "name": name,
+        "language": language,
+        "confidence": "confirmed" if active else "probable",
+        "status": "active" if active else "declared",
+        "evidence": evidence,
+        "test_files": [],
+        "test_definition_count": 0,
+    }
+
+
+def _scan(root_arg: str, output_arg: str | None, includes: list[str], excludes: list[str],
+          default_excludes: bool, verbose: bool) -> tuple[Path, Path]:
+    supplied_root = Path(root_arg).expanduser()
+    if not supplied_root.exists():
+        raise ValueError(f"Repository path does not exist: {root_arg}")
+    if not supplied_root.is_dir():
+        raise ValueError(f"Repository path is not a directory: {root_arg}")
+    root = supplied_root.resolve(strict=True)
+    if not os.access(root, os.R_OK):
+        raise ValueError(f"Repository directory is not readable: {root}")
+
+    if output_arg:
+        output_dir = Path(output_arg).expanduser().resolve()
+    else:
+        digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+        output_dir = Path(tempfile.gettempdir()) / "repository-test-inventory" / digest
+    if _inside(output_dir, root):
+        raise ValueError("Output directory must be outside the scanned repository.")
+
+    limitations: list[str] = []
+    excluded_paths: list[str] = []
+    paths = _walk(root, includes, excludes, default_excludes, limitations, excluded_paths)
+    texts: dict[str, str] = {}
+    manifest_frameworks: dict[str, list[dict[str, Any]]] = {}
+    supporting: dict[str, list[dict[str, Any]]] = {}
+    package_framework_keys: dict[str, set[str]] = {}
+    config_framework_keys: dict[str, set[str]] = {}
+    projects = [path for path in paths if path.suffix.lower() == ".csproj"]
+    solutions = [path for path in paths if path.suffix.lower() in {".sln", ".slnx"}]
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        basename = path.name.lower()
+        is_runner_config = any(
+            basename.startswith(config_name)
+            for config_names in CONFIG_HINTS.values()
+            for config_name in config_names
+        )
+        if path.suffix.lower() not in SOURCE_SUFFIXES | {".csproj", ".sln", ".slnx"} and path.name != "package.json" and not is_runner_config:
+            continue
+        try:
+            if path.stat().st_size > 1_000_000:
+                limitations.append(f"Skipped file larger than 1 MB: {relative}")
+                continue
+            content = path.read_text(encoding="utf-8")
+            texts[relative] = content
+        except (OSError, UnicodeError) as error:
+            limitations.append(f"Could not read {relative}: {error}")
+
+    for relative, content in texts.items():
+        lower_path = relative.lower()
+        if Path(relative).name == "package.json":
+            try:
+                manifest = json.loads(content)
+            except json.JSONDecodeError as error:
+                limitations.append(f"Invalid JSON manifest {relative}: {error.msg} at line {error.lineno}")
+                continue
+            if not isinstance(manifest, dict):
+                limitations.append(f"Invalid JSON manifest {relative}: expected an object")
+                continue
+            dependencies: dict[str, Any] = {}
+            for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                section_value = manifest.get(section, {})
+                if isinstance(section_value, dict):
+                    dependencies.update(section_value)
+            for key, metadata in JS_FRAMEWORKS.items():
+                matched = [pkg for pkg in metadata[2] if pkg.lower() in {name.lower() for name in dependencies}]
+                if matched:
+                    manifest_frameworks.setdefault(key, []).append(_evidence(relative, None, f"Declared package(s): {', '.join(matched)}"))
+                    package_framework_keys.setdefault(relative, set()).add(key)
+            for key, (label, package_names) in SUPPORT_PACKAGES.items():
+                matched = [pkg for pkg in package_names if pkg.lower() in {name.lower() for name in dependencies}]
+                if matched:
+                    supporting.setdefault(key, []).append(_evidence(relative, None, f"Declared supporting package(s): {', '.join(matched)}"))
+        if lower_path.endswith(".csproj"):
+            for key, metadata in DOTNET_FRAMEWORKS.items():
+                matches = [package for package in metadata[2] if re.search(rf"<PackageReference\b[^>]*\bInclude\s*=\s*['\"]{re.escape(package)}['\"]", content, re.I)]
+                if matches:
+                    manifest_frameworks.setdefault(key, []).append(_evidence(relative, None, f"Declared package(s): {', '.join(matches)}"))
+            for key, (label, package_names) in SUPPORT_PACKAGES.items():
+                matches = [package for package in package_names if re.search(rf"<PackageReference\b[^>]*\bInclude\s*=\s*['\"]{re.escape(package)}['\"]", content, re.I)]
+                if matches:
+                    supporting.setdefault(key, []).append(_evidence(relative, None, f"Declared supporting package(s): {', '.join(matches)}"))
+        filename = Path(relative).name.lower()
+        for key, config_names in CONFIG_HINTS.items():
+            if any(filename.startswith(config_name) for config_name in config_names):
+                manifest_frameworks.setdefault(key, []).append(_evidence(relative, None, "Framework configuration file"))
+                config_framework_keys.setdefault(relative, set()).add(key)
+
+    active_frameworks: dict[str, dict[str, Any]] = {}
+    test_files: list[dict[str, Any]] = []
+    all_framework_evidence: dict[str, list[dict[str, Any]]] = {key: list(value) for key, value in manifest_frameworks.items()}
+    source_relatives = [rel for rel in texts if Path(rel).suffix.lower() in SOURCE_SUFFIXES]
+    for relative in source_relatives:
+        raw = texts[relative]
+        ext = Path(relative).suffix.lower()
+        masked = _mask_comments(raw, hash_comments=ext in {".py", ".rb", ".sh", ".r"})
+        if ext == ".cs":
+            masked = _mask_inactive_csharp(masked)
+        code = _mask_strings(masked)
+        if ext == ".cs":
+            code = _mask_inactive_csharp(code)
+            declarations: list[dict[str, Any]] = []
+            csharp_declarations: dict[tuple[int, str], dict[str, Any]] = {}
+            for match in CS_ATTRIBUTE.finditer(code):
+                attribute = match.group("attribute")
+                key = next((k for k, (_, _, _, pattern) in DOTNET_FRAMEWORKS.items() if re.fullmatch(pattern, f"[{attribute}]", re.I)), None)
+                if not key:
+                    key = "nunit" if attribute.lower() in {"test", "testcase", "testcasesource"} else "xunit" if attribute.lower() in {"fact", "theory"} else "mstest"
+                preceding_attributes = code[max(0, match.start() - 200):match.start()]
+                following_attributes = code[match.end():match.end() + 200]
+                skipped = bool(
+                    re.search(r"\b(?:Skip|Ignore)\s*=", match.group("arguments"), re.I)
+                    or re.search(r"\[\s*Ignore\b[^\]]*\]\s*$", preceding_attributes, re.I)
+                    or re.search(r"\[\s*Ignore\b[^\]]*\]", following_attributes, re.I)
+                )
+                following_method = code[match.end():match.end() + 500]
+                method = re.search(
+                    r"\b(?:public|private|protected|internal)\s+"
+                    r"(?:(?:static|async|virtual|override|sealed|new|partial)\s+)*"
+                    r"(?:[\w.<>,?\[\]]+\s+)+(?P<name>\w+)\s*\(",
+                    following_method,
+                )
+                declaration_offset = match.end() + method.start() if method else match.start()
+                declaration_key = (declaration_offset, key)
+                declaration = {
+                    "kind": "test",
+                    "framework": key,
+                    "line": _line(masked, match.start()),
+                    "status": "skipped" if skipped else "active",
+                    "evidence": f"[{attribute}]",
+                }
+                existing = csharp_declarations.get(declaration_key)
+                if existing:
+                    if skipped:
+                        existing["status"] = "skipped"
+                    if declaration["evidence"] not in existing["evidence"]:
+                        existing["evidence"] += ", " + declaration["evidence"]
+                else:
+                    csharp_declarations[declaration_key] = declaration
+            declarations.extend(csharp_declarations.values())
+            detected_keys = {d["framework"] for d in declarations}
+            for key, (_, _, _, pattern) in DOTNET_FRAMEWORKS.items():
+                if re.search(pattern, code, re.I) and key in detected_keys:
+                    all_framework_evidence.setdefault(key, []).append(_evidence(relative, None, "Test attribute used in source"))
+        else:
+            declarations = []
+            for match in JS_DECLARATION.finditer(code):
+                chain = match.group("chain").replace(" ", "").replace("\t", "")
+                status = "todo" if ".todo" in chain or match.group("name") in {"xit", "xtest"} else "skipped" if ".skip" in chain else "active"
+                declarations.append({
+                    "kind": "test",
+                    "framework": None,
+                    "line": _line(masked, match.start()),
+                    "status": status,
+                    "evidence": match.group(0).strip(),
+                })
+            suite_matches = list(JS_SUITE.finditer(code))
+            for match in suite_matches:
+                chain = match.group("chain").replace(" ", "").replace("\t", "")
+                declarations.append({
+                    "kind": "suite",
+                    "framework": None,
+                    "line": _line(masked, match.start()),
+                    "status": "todo" if match.group("name") in {"xdescribe"} else "skipped" if ".skip" in chain else "active",
+                    "evidence": match.group(0).strip(),
+                })
+            if ext not in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
+                unknown_pattern = UNKNOWN_DECLARATIONS.get(ext)
+                if unknown_pattern:
+                    for match in unknown_pattern.finditer(code):
+                        declarations.append({
+                            "kind": "suspected_test",
+                            "framework": None,
+                            "line": _line(masked, match.start()),
+                            "status": "unknown",
+                            "evidence": match.group(0).strip() or "Framework-neutral test declaration marker",
+                        })
+
+        text_name = Path(relative).name.lower()
+        test_like = any(token in text_name for token in ("test", "spec", "checks")) or any(
+            part.lower() in {"test", "tests", "__tests__", "spec", "specs"} for part in Path(relative).parts
+        )
+        if not declarations and not test_like:
+            continue
+
+        if ext == ".cs":
+            used_keys = sorted({item["framework"] for item in declarations if item["kind"] == "test"})
+        else:
+            has_test_declaration = any(item["kind"] == "test" for item in declarations)
+            source_path = Path(relative)
+            source_parents = [source_path.parent, *source_path.parent.parents]
+            local_packages = [
+                (len(Path(manifest).parent.parts), keys)
+                for manifest, keys in package_framework_keys.items()
+                if Path(manifest).parent in source_parents
+            ]
+            local_configs = [
+                (len(Path(config).parent.parts), keys)
+                for config, keys in config_framework_keys.items()
+                if Path(config).parent in source_parents
+            ]
+            declared_js: set[str] = set()
+            if has_test_declaration and local_packages:
+                declared_js.update(max(local_packages, key=lambda item: item[0])[1])
+            if has_test_declaration and local_configs:
+                declared_js.update(max(local_configs, key=lambda item: item[0])[1])
+            imports: list[str] = []
+            for key, metadata in JS_FRAMEWORKS.items():
+                if any(re.search(rf"""(?:from\s*|require\s*\()\s*['"]{re.escape(pkg)}['"]""", masked, re.I) for pkg in metadata[2]):
+                    imports.append(key)
+            if has_test_declaration and imports:
+                used_keys = sorted(set(imports))
+            elif has_test_declaration and len(declared_js) == 1:
+                used_keys = sorted(declared_js)
+            elif has_test_declaration:
+                matched = [key for key, metadata in JS_FRAMEWORKS.items() if re.search(metadata[3], code)]
+                # Generic assertion and test APIs are not enough to distinguish Jest from Vitest/Mocha.
+                used_keys = sorted(matched) if len(matched) == 1 else []
+            else:
+                used_keys = []
+        if ext != ".cs" and used_keys:
+            selected = used_keys[0] if len(used_keys) == 1 else None
+            for item in declarations:
+                if item["kind"] == "test":
+                    item["framework"] = selected
+        framework_names = []
+        for key in used_keys:
+            metadata = DOTNET_FRAMEWORKS.get(key) or JS_FRAMEWORKS.get(key)
+            if metadata:
+                framework_names.append(metadata[0])
+                all_framework_evidence.setdefault(key, []).append(_evidence(relative, None, "Recognized test API or attribute"))
+        classified, category_evidence = _classify(code, used_keys)
+        if len(used_keys) > 1:
+            framework_confidence = "probable"
+        elif used_keys:
+            framework_confidence = "confirmed"
+        else:
+            framework_confidence = "unknown"
+        test_definition_count = sum(1 for item in declarations if item["kind"] == "test")
+        test_files.append({
+            "path": relative,
+            "language": _language(ext),
+            "frameworks": framework_names or ["Unknown"],
+            "category": classified,
+            "confidence": framework_confidence,
+            "test_definition_count": test_definition_count,
+            "suspected_definition_count": sum(1 for item in declarations if item["kind"] == "suspected_test"),
+            "suite_count": sum(1 for item in declarations if item["kind"] == "suite"),
+            "skipped_test_count": sum(1 for item in declarations if item["kind"] == "test" and item["status"] == "skipped"),
+            "todo_test_count": sum(1 for item in declarations if item["kind"] == "test" and item["status"] == "todo"),
+            "definitions": declarations,
+            "evidence": [_evidence(relative, item["line"], item["evidence"]) for item in declarations],
+            "classification_evidence": category_evidence,
+            "test_project": _nearest_project(root / relative, projects, root),
+            "suspected": not bool(used_keys),
+        })
+
+    for key, evidence in all_framework_evidence.items():
+        metadata = DOTNET_FRAMEWORKS.get(key) or JS_FRAMEWORKS.get(key)
+        if not metadata:
+            continue
+        active_files = sorted({item["path"] for item in test_files if any(definition.get("framework") == key for definition in item["definitions"])})
+        if not active_files and evidence:
+            entry = _framework_entry(key, metadata, evidence, False)
+        else:
+            entry = _framework_entry(key, metadata, evidence, True)
+        entry["test_files"] = active_files
+        entry["test_definition_count"] = sum(
+            1 for item in test_files for definition in item["definitions"]
+            if definition["kind"] == "test" and definition.get("framework") == key
+        )
+        active_frameworks[key] = entry
+
+    for item in test_files:
+        if item["test_project"]:
+            continue
+        if item["language"] == ".NET" and item["confidence"] == "confirmed":
+            item["test_project"] = "(project file not found)"
+    test_projects = []
+    for project in projects:
+        rel = project.relative_to(root).as_posix()
+        associated = [item["path"] for item in test_files if item["test_project"] == rel]
+        if associated or any(e["file"] == rel for key in ("nunit", "xunit", "mstest") for e in manifest_frameworks.get(key, [])):
+            test_projects.append({"path": rel, "test_files": associated, "evidence": "Test source or test framework package reference"})
+
+    summary = {
+        "test_file_count": len(test_files),
+        "test_definition_count": sum(item["test_definition_count"] for item in test_files),
+        "test_suite_count": sum(item["suite_count"] for item in test_files),
+        "explicitly_skipped_test_count": sum(item["skipped_test_count"] for item in test_files),
+        "todo_or_pending_test_count": sum(item["todo_test_count"] for item in test_files),
+        "unknown_or_unclassified_test_file_count": sum(1 for item in test_files if item["category"] == "unknown" or item["suspected"]),
+        "classification_counts": {category: sum(1 for item in test_files if item["category"] == category) for category in ("ui_e2e", "component", "unit", "api", "integration", "unknown")},
+        "test_project_count": len(test_projects),
+        "framework_count": len(active_frameworks),
+    }
+    scan = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": "static_read_only",
+        "status": "completed_with_limitations" if limitations else "completed",
+        "default_exclusions_enabled": default_excludes,
+        "include_patterns": includes,
+        "exclude_patterns": excludes,
+        "excluded_paths": sorted(set(excluded_paths)),
+        "files_inspected": len(texts),
+        "solutions": [p.relative_to(root).as_posix() for p in solutions],
+    }
+    languages = sorted({item["language"] for item in test_files if item["language"] != "Unknown"})
+    inventory = {
+        "schema_version": "1.0",
+        "repository": {"path": str(root), "identifier": root.name},
+        "scan": scan,
+        "languages": languages,
+        "frameworks": sorted(active_frameworks.values(), key=lambda item: item["name"].lower()),
+        "supporting_libraries": [
+            {"name": SUPPORT_PACKAGES[key][0], "evidence": evidence}
+            for key, evidence in sorted(supporting.items())
+        ],
+        "test_projects": test_projects,
+        "test_files": test_files,
+        "summary": summary,
+        "limitations": sorted(set(limitations)),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    md_path = output_dir / "inventory-report.md"
+    json_path = output_dir / "test-inventory.json"
+    json_path.write_text(json.dumps(inventory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    md_path.write_text(_render_markdown(inventory), encoding="utf-8")
+    if verbose:
+        print(f"Inspected {len(texts)} text files; found {len(test_files)} test files.", file=sys.stderr)
+    return md_path, json_path
+
+
+def _language(ext: str) -> str:
+    return {
+        ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+        ".ts": "TypeScript", ".tsx": "TypeScript", ".mts": "TypeScript", ".cts": "TypeScript",
+        ".cs": ".NET", ".py": "Python", ".java": "Java", ".kt": "Kotlin", ".go": "Go",
+        ".rb": "Ruby", ".php": "PHP", ".rs": "Rust", ".scala": "Scala", ".swift": "Swift",
+    }.get(ext, "Unknown")
+
+
+def _classify(masked: str, framework_keys: list[str]) -> tuple[str, list[str]]:
+    code = masked.lower()
+    evidence: list[str] = []
+    if (re.search(r"\b(?:page|browser|driver)\.(?:goto|navigate|url|get)\b|\bcy\.visit\b|\bpuppeteer\b|\bselenium\b|\bplaywright\b", code)
+            or "webdriverio" in framework_keys or "protractor" in framework_keys or "testcafe" in framework_keys):
+        evidence.append("Browser automation API or framework reference")
+        return "ui_e2e", evidence
+    if re.search(r"@testing-library/(?:react|angular)|\b(?:render|rendercomponent|testcontext)\s*\(", code) or "bunit" in code:
+        evidence.append("Component render/testing API")
+        return "component", evidence
+    if re.search(r"\b(?:request|client|httpclient)\.(?:get|post|put|delete|fetch)\s*\(|\bfetch\s*\(", code):
+        evidence.append("HTTP/API request call")
+        return "api", evidence
+    if re.search(r"\b(?:testserver|webapplicationfactory|testcontainer|databasefixture|integration)\b", code):
+        evidence.append("Integration or external-system test indicator")
+        return "integration", evidence
+    if re.search(r"\b(?:unit)\b", code):
+        evidence.append("Unit-test path or identifier")
+        return "unit", evidence
+    return "unknown", evidence
+
+
+def _render_markdown(data: dict[str, Any]) -> str:
+    summary = data["summary"]
+    lines = [
+        "# Repository Test Inventory", "",
+        "## Repository Overview", "",
+        f"- Repository: `{data['repository']['path']}`",
+        f"- Scan timestamp (UTC): {data['scan']['timestamp_utc']}",
+        f"- Scan mode: `{data['scan']['mode']}`",
+        f"- Completion status: `{data['scan']['status']}`",
+        f"- Languages detected: {', '.join(data['languages']) or 'None'}",
+        f"- Frameworks identified: {', '.join(item['name'] for item in data['frameworks']) or 'None'}", "",
+        "## Test Inventory Summary", "",
+        f"- Test files: {summary['test_file_count']}",
+        f"- Recognized test definitions: {summary['test_definition_count']}",
+        f"- Recognized suites: {summary['test_suite_count']}",
+        f"- Test projects: {summary['test_project_count']}",
+        f"- Explicitly skipped tests: {summary['explicitly_skipped_test_count']}",
+        f"- TODO/pending tests: {summary['todo_or_pending_test_count']}",
+        f"- Unknown/unclassified test files: {summary['unknown_or_unclassified_test_file_count']}", "",
+        "- Test projects:",
+    ]
+    if data["test_projects"]:
+        lines.extend(
+            f"  - `{project['path']}` ({len(project['test_files'])} associated test file(s))"
+            for project in data["test_projects"]
+        )
+    else:
+        lines.append("  - None identified.")
+    lines.extend([
+        "",
+        "## Framework Inventory", "",
+    ])
+    if data["frameworks"]:
+        for framework in data["frameworks"]:
+            lines.extend([
+                f"### {framework['name']}", "",
+                f"- Language: {framework['language']}",
+                f"- Confidence: `{framework['confidence']}`",
+                f"- Status: `{framework['status']}`",
+                f"- Test files: {', '.join(f'`{path}`' for path in framework['test_files']) or 'None'}",
+                f"- Recognized test definitions: {framework['test_definition_count']}",
+                "- Evidence:",
+            ])
+            lines.extend(f"  - {_format_evidence(evidence)}" for evidence in framework["evidence"])
+            lines.append("")
+    else:
+        lines.extend(["No frameworks identified.", ""])
+    if data["supporting_libraries"]:
+        lines.extend(["### Supporting Libraries", ""])
+        for library in data["supporting_libraries"]:
+            lines.extend([f"- **{library['name']}**:", *[f"  - {_format_evidence(item)}" for item in library["evidence"]]])
+        lines.append("")
+    lines.extend(["## Testing Classification", ""])
+    for category, count in summary["classification_counts"].items():
+        lines.append(f"- {category}: {count}")
+    lines.extend(["", "## Test File Inventory", ""])
+    if data["test_files"]:
+        lines.extend(["| File | Framework | Category | Definitions | Skipped | Confidence |", "|---|---|---:|---:|---:|---|"])
+        for item in data["test_files"]:
+            lines.append(f"| `{item['path']}` | {', '.join(item['frameworks'])} | {item['category']} | {item['test_definition_count']} | {item['skipped_test_count']} | {item['confidence']} |")
+        lines.append("")
+        for item in data["test_files"]:
+            lines.extend([f"### Evidence: `{item['path']}`", ""])
+            lines.extend(f"- {_format_evidence(evidence)}" for evidence in item["evidence"])
+            lines.extend(f"- Classification: {item['category']} ({', '.join(item['classification_evidence']) or 'insufficient implementation evidence'})")
+            lines.append("")
+    else:
+        lines.extend(["No test files identified.", ""])
+    lines.extend(["## Unknown or Unclassified Assets", ""])
+    unknowns = [item for item in data["test_files"] if item["suspected"] or item["category"] == "unknown"]
+    lines.extend([f"- `{item['path']}`: framework/category evidence insufficient; {item['suspected_definition_count']} probable unrecognized declaration site(s)." for item in unknowns] or ["None identified."])
+    lines.extend(["", "## Scan Limitations", ""])
+    lines.extend([f"- {item}" for item in data["limitations"]] or ["- No inaccessible or skipped files were recorded."])
+    lines.extend([
+        f"- Default exclusions enabled: {data['scan']['default_exclusions_enabled']}.",
+        f"- Explicit exclusions: {', '.join(data['scan']['exclude_patterns']) or 'None'}.",
+        f"- Excluded paths encountered: {', '.join(f'`{path}`' for path in data['scan']['excluded_paths']) or 'None'}.",
+        "- Static pattern analysis cannot resolve arbitrary aliases, generated tests, or runtime-dependent configuration.",
+        "- Conditional skip expressions and runner-level excluded test-file patterns are not evaluated.",
+        "- Frameworks outside the configured JavaScript/TypeScript and .NET signature sets may remain Unknown.",
+        "", "## Evidence", "",
+        "Paths are repository-relative; line numbers identify declaration locations. Framework and classification evidence is listed above. Definitions are static declaration counts, not runtime test cases or executions.", "",
+    ])
+    return "\n".join(lines)
+
+
+def _format_evidence(item: dict[str, Any]) -> str:
+    location = item["file"] + (f":{item['line']}" if item.get("line") else "")
+    return f"`{location}` — {item['detail']}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repository_path", help="Repository directory to inspect")
+    parser.add_argument("--output-directory", help="Report directory outside the repository")
+    parser.add_argument("--include", action="append", default=[], help="Repository-relative include pattern (repeatable)")
+    parser.add_argument("--exclude", action="append", default=[], help="Repository-relative exclude pattern (repeatable)")
+    parser.add_argument("--no-default-excludes", action="store_true", help="Scan normally excluded generated/dependency directories")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+    try:
+        markdown, structured = _scan(
+            args.repository_path, args.output_directory, args.include, args.exclude,
+            not args.no_default_excludes, args.verbose,
+        )
+    except (OSError, ValueError) as error:
+        print(f"repository-test-inventory: {error}", file=sys.stderr)
+        return 2
+    print(f"Markdown report: {markdown}")
+    print(f"JSON inventory: {structured}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
