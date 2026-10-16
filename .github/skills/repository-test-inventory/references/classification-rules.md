@@ -25,3 +25,5 @@ The Markdown and JSON files are rendered from the same model. Paths are reposito
 The JSON contract is documented in `README.md`. Stable enum values are lowercase `confirmed`, `probable`, `unknown` for confidence and `ui_e2e`, `component`, `unit`, `api`, `integration`, `unknown` for categories.
 
 See [validation contract](./validation-contract.md) for independent discovery, attribution, classification, status, and parameterization measurements. Unknown framework and unknown category are different evidence gaps; report them separately.
+
+For baseline-backed reports, include discovery TP/FP/FN and precision/recall/F1, matched-definition dimension results, exclusion checks, unknown-asset retention, and unverifiable checks. Keep full-baseline metrics distinct from supported-scope metrics. Similar observed and expected totals can hide both false positives and false negatives; without assessable definition-level matching, accuracy is not evaluated. Do not repair reported categories or identities from baseline expectations.
