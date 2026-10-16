@@ -2,7 +2,19 @@
 
 A portable, standard-library-only agent Skill and deterministic Python scanner for discovering automated tests in local repositories. It inventories test files, declared and actively used frameworks, recognized test/suite declarations, test projects, explicit skips/TODOs, static test categories, supporting libraries, evidence, and scan limitations.
 
-The scanner is read-only with respect to the target repository. It never invokes tests, project code, package managers, build tools, or framework CLIs, and it does not connect to the network. Markdown and JSON are generated from the same inventory object. All validation fixtures are created dynamically under temporary directories.
+The scanner is read-only with respect to the target repository. It never invokes tests, project code, package managers, build tools, or framework CLIs, and it does not connect to the network. Markdown and JSON are generated from the same inventory object. The skill's regression tests create synthetic fixtures under temporary directories; independent baseline validation uses a separately supplied target and answer key.
+
+## Choose a workflow
+
+| Goal | Entry point | What success establishes |
+|---|---|---|
+| Inventory a repository without an answer key | `scripts/scan-repository.py` | Static inventory generated; accuracy is not evaluated |
+| Scan and compare with an independent answer key | `scripts/scan-and-validate.py` | Separate scan, assessability, and validation outcomes |
+| Compare a previously generated schema `1.1` inventory | `scripts/validate-inventory.py` | Definition-level comparison, not a new scan |
+| Test changes to this skill | Standard-library `unittest` suite | Scanner/validator/workflow regressions pass, not target tests |
+
+No workflow establishes runtime test execution, code coverage, or application
+quality. A static definition is a declaration site, not a count of runtime cases.
 
 ## Installation
 
@@ -20,6 +32,21 @@ Open the repository containing `.github` as your workspace, or install the folde
 in the intended workspace. In a fresh agent session, verify that the canonical
 skill is listed and loads. Running the scanner alone does not verify agent loading.
 
+## Use with an AI agent
+
+Example request:
+
+> Use repository-test-inventory to inventory automated tests in
+> `/absolute/path/to/my repository`. Do not run target tests or modify target
+> files. Save reports outside the target and summarize frameworks, categories,
+> skips, unknowns, exclusions, and limitations.
+
+If you have an independent baseline, provide its path, the intended include/exclude
+policy, and a fresh output directory too. The agent should read the skill and
+generated reports, not infer accuracy from matching aggregate totals.
+If the skill does not appear, check the opened workspace and installation folder,
+then start a fresh session. Manual script execution is still available.
+
 ## Run without an AI agent
 
 Prerequisite: **Python 3.10+**, with no third-party dependencies. These commands test the deterministic scanner, **not** an agent's ability to discover, load, or follow this Skill.
@@ -28,26 +55,37 @@ Start in the repository containing the installed Skill (the folder containing `.
 
 ```sh
 SKILL_DIR="$PWD/.github/skills/repository-test-inventory"
-TARGET_REPO="/absolute/path/to/fixture repository"
-REPORT_DIR="$HOME/test-inventory-results/new-run"
+TARGET_REPO="/absolute/path/to/my repository"
+REPORT_DIR="$HOME/test-inventory-results/scan-only-001"
 python3 --version
 python3 "$SKILL_DIR/scripts/scan-repository.py" "$TARGET_REPO" \
-  --output-directory "$REPORT_DIR" \
-  --exclude "scenarios/09-edge-cases/generated" --verbose
+  --output-directory "$REPORT_DIR" --verbose
 ```
 
-For another installation/target, change the starting directory and `TARGET_REPO`. The explicit generated-directory exclusion above is the controlled fixture's policy, **not a scanner default**. For an ordinary scan, omit that option unless appropriate. With an absolute `SKILL_DIR`, commands work from any directory, including paths containing spaces.
+For another installation/target, change the starting directory and `TARGET_REPO`.
+With an absolute `SKILL_DIR`, commands work from any directory, including paths
+containing spaces. Only add exclusions required by your scan policy.
 
 ### One-command scan and validation
 
 When an independent baseline is available, prefer:
 
 ```sh
+BASELINE="/absolute/path/to/expected-inventory.json"
+REPORT_DIR="$HOME/test-inventory-results/validated-001"
 python3 "$SKILL_DIR/scripts/scan-and-validate.py" "$TARGET_REPO" \
-  --expected "$TARGET_REPO/validation/expected-inventory.json" \
-  --output-directory "$REPORT_DIR" \
-  --exclude "scenarios/09-edge-cases/generated"
+  --expected "$BASELINE" \
+  --output-directory "$REPORT_DIR"
+WORKFLOW_EXIT=$?
+printf 'Workflow exit code: %s\n' "$WORKFLOW_EXIT"
 ```
+
+Use a different directory from the scan-only example, and a new name for each
+subsequent combined run. The baseline may be outside the target. For the controlled
+`qa-test-inventory-validation` fixture, set `TARGET_REPO` to that fixture root,
+set `BASELINE="$TARGET_REPO/validation/expected-inventory.json"`, and add
+`--exclude "scenarios/09-edge-cases/generated"` to the workflow command.
+That exclusion is the fixture's explicit policy, **not a scanner default**.
 
 Use a **fresh, empty** report directory outside the target. This workflow refuses
 to overwrite prior evidence. It accepts the scanner's `--include`, `--exclude`,
@@ -63,7 +101,7 @@ are explicitly recorded as errors, not successful empty comparisons.
 Timings are local measurements, not a benchmark. Measure larger repositories
 before adding performance caches, concurrency, or dependencies.
 
-Reports must be outside `TARGET_REPO`. The scanner creates the report directory and generates `inventory-report.md` and `test-inventory.json`. It prints their locations. Exit `0` means the scan completed, not that the inventory is accurate or validated; inspect `scan.status` and `limitations` too. Existing report files are overwritten; linked report files are rejected.
+Reports must be outside `TARGET_REPO`. The standalone scanner creates the report directory and generates `inventory-report.md` and `test-inventory.json`. It prints their locations. Exit `0` means the scan completed, not that the inventory is accurate or validated; inspect `scan.status` and `limitations` too. Standalone scanner and validator commands overwrite their own existing report files; linked report files are rejected. The combined workflow instead requires an empty output directory.
 
 Run the scanner's own synthetic regression tests, from the same starting directory:
 
@@ -73,12 +111,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$SKILL_DIR/tests" -v
 
 `OK` means these scanner/validator regressions passed. It does not execute target tests or establish fixture-discovery accuracy.
 
-Assess the controlled fixture using the bundled compatibility validator:
+To validate an existing scan without rescanning, set `REPORT_DIR` to the directory
+containing its inventory and `BASELINE` to the independent answer key, then run:
 
 ```sh
 python3 "$SKILL_DIR/scripts/validate-inventory.py" \
   --inventory "$REPORT_DIR/test-inventory.json" \
-  --expected "$TARGET_REPO/validation/expected-inventory.json" \
+  --expected "$BASELINE" \
   --output-directory "$REPORT_DIR"
 VALIDATION_EXIT=$?
 printf 'Validation exit code: %s\n' "$VALIDATION_EXIT"
@@ -94,6 +133,142 @@ This generates `adapted-inventory.json`, `validation-result.json`, and `validati
 | `3` | Required comparisons are unverifiable; **not a pass** |
 
 Read `scan_completed`, `results_assessable`, and `validation_passed` separately. `unknown` predictions are measured as abstentions, not missing schema data. Missing required fields are `UNVERIFIABLE`. Dimension results use matched definitions only; missing definitions remain in discovery recall.
+
+### Generated files and where to start
+
+| File | Purpose |
+|---|---|
+| `inventory-report.md` | Human-readable inventory, framework/tool evidence, per-definition classification and iteration details, exclusions and limitations |
+| `test-inventory.json` | Full schema `1.1` static inventory |
+| `adapted-inventory.json` | Recognized definitions normalized for baseline comparison |
+| `validation-report.md` | Compact discovery and dimension check results |
+| `validation-result.json` | Full mismatches, unknown records, missing/unexpected definitions, exclusion/unknown-asset checks and provenance |
+| `workflow-summary.json` | Combined workflow only: stage exits/timings, hashes, commands, report paths and measured results |
+
+For a scan-only run, start with `inventory-report.md`. For a combined run, start
+with `workflow-summary.json` and `validation-report.md`, then inspect the full
+JSON discrepancies. An input error can stop a stage before all reports exist;
+read stderr and the summary's `error` when available. Preflight errors may occur
+before a summary is written.
+
+### Understanding a non-pass
+
+These outcomes answer different questions:
+
+- **Scan completed:** the scanner generated an inventory, possibly with reported
+  limitations. This is not proof that every test was found.
+- **Results assessable:** the required identities/fields permit comparison.
+  An explicit `unknown` is an assessable abstention; an absent required field or
+  unresolved source name can make a comparison unverifiable.
+- **Validation passed:** all required checks agree with the baseline and the scan
+  completed. Unknown predictions fail exact dimension checks, even when there are
+  no confidently wrong predictions.
+
+Discovery reports true positives (TP: expected definitions found), false positives
+(FP: unexpected definitions), and false negatives (FN: expected definitions missed).
+Precision is `TP / (TP + FP)`, recall is `TP / (TP + FN)`, and F1 combines them.
+Framework/category/status/parameterization comparisons use matched definitions
+only. Full-baseline recall retains unsupported definitions as misses;
+supported-scope recall is an additional measurement, not a replacement.
+
+**Unknown category is not unknown framework.** A test can be confidently attributed
+to Jest while its category remains unknown. For example,
+`expect(service).toBeDefined()` does not prove that the service is isolated from
+databases or other systems. The scanner does not guess Unit from the runner,
+test title, project name, or baseline expectation.
+
+**Framework parameterization is not body iteration:**
+
+```javascript
+test.each([1, 2])('accepts %s', value => {
+  expect(value).toBeGreaterThan(0);
+}); // parameterized: true; body_iteration: false
+
+test('accepts positive inputs', () => {
+  for (const value of [1, 2]) {
+    expect(value).toBeGreaterThan(0);
+  }
+}); // parameterized: false; body_iteration: true
+```
+
+Each example is one static definition. The second contains repeated checks, but
+the framework is not parameterizing the declaration. A baseline using a broader
+meaning can disagree. Preserve that discrepancy and review the definitions
+explicitly; do not relabel the report or silently edit the baseline to get a pass.
+
+**Repeatability is not accuracy.** With the same inputs, options, scanner and
+environment, the follow-up run's inventory JSON and Markdown were identical apart
+from scan timestamps. Workflow elapsed timings also vary. Stable output makes
+comparisons reliable, but cannot prove the scanner's decisions are correct.
+
+### Measured Run 3 follow-up
+
+The skill update following Run 3 was checked against the independent
+100-definition fixture with its explicit generated-directory exclusion:
+
+| Measurement | Result |
+|---|---:|
+| Discovery TP / FP / FN | 100 / 0 / 0 |
+| Precision / recall / F1 | 100% / 100% / 100% |
+| Supported-scope recall | 100 / 100 |
+| Framework and status | Each 100 / 100 correct |
+| Category | 57 correct, 0 incorrect, 43 unknown |
+| Framework parameterization | 99 matches, 1 baseline disagreement |
+| Exclusions and required unknown-asset retention | PASS |
+| Skill regression tests | 57 passed |
+| Overall validation / exit | Non-pass / `1` |
+
+The remaining parameterization disagreement is a body-loop test: the baseline
+expects `true`, while the chosen declaration-driven policy reports
+`parameterized: false` and `body_iteration: true`. The category abstentions and
+that disagreement explain the non-pass; they are not a scanner crash or discovery
+failure. The independent baseline was left unchanged. These are results for this
+fixture, not a guarantee for arbitrary repositories, and fixture tests were not
+executed.
+
+### Independent baseline requirements
+
+An answer key must be a JSON object with `expected_definition_count` and a
+`definitions` array. For example:
+
+```json
+{
+  "expected_definition_count": 1,
+  "definitions": [
+    {
+      "path": "tests/math.test.js",
+      "identifier": "adds two numbers",
+      "framework": "Jest",
+      "primary_category": "unit",
+      "status": "active",
+      "parameterized": false
+    }
+  ]
+}
+```
+
+Use repository-relative POSIX paths from the **same root** as the scan, source
+titles/method names, and unique normalized path/name pairs. Supply all four
+dimension fields shown above for each expected definition. Baseline category
+`ui` maps to scanner `ui_e2e`, and baseline status `pending` maps to scanner `todo`.
+An optional `test_id` can match the first whitespace-delimited source-title token;
+it does not establish correct classification. Optional `excluded_fixtures` and
+`unknown_assets` arrays contain records with `path`; `negative_scenarios` lists
+scenario names. See the [validation contract](./references/validation-contract.md)
+for matching and policy details. Do not generate the answer key from scanner
+output and then claim independent accuracy.
+
+### Troubleshooting
+
+| Symptom | Action |
+|---|---|
+| Combined workflow refuses the report directory | Choose a new, empty directory outside the target; do not overwrite prior evidence |
+| Exit `1` with reports present | Inspect failed checks and JSON discrepancies; this is an assessable non-pass |
+| Exit `2` | Read stderr; verify Python version, paths, permissions, JSON/schema and output safety |
+| Exit `3` | Inspect missing fields or unresolved names; do not treat unverifiable results as a pass |
+| A generated fixture appears unexpectedly | Verify explicit exclusions; arbitrary `generated` folders and runner ignore rules are not default exclusions |
+| Python tests are suspected rather than confirmed | Check explicit pytest imports/ancestor configuration and AST syntax limitations |
+| Counts differ from a test runner | Static declarations do not equal runtime collection, parameter rows, or executions |
 
 ### Reviewing a follow-up run
 
